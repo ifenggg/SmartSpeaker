@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include <bt_a2dp.h>
 #include <ble.h>
+#include "ble_client.h"
 #include "led_strip.h"
 #include "uart.h"
 #include "sd.h"
@@ -161,7 +162,8 @@ void app_main(void)
     uart_2_init();  //串口屏通讯
     bt_init();      //蓝牙双模开启(总开关)
     bt_a2dp_work();     //蓝牙播放功能(经典蓝牙)
-    //ble_gatt_init();  //gatt协议(ble蓝牙)
+    ble_client_init();  //BLE GATT Client（主机模式，连接OV-Watch手表）—— 替代原 BLE Server 逻辑
+    //ble_gatt_init();  //gatt协议(ble蓝牙) —— 原 BLE Server 初始化，已废弃（见 ble_client.c）
     // ble_gattc_init();    //客户端gatt
     // ble_gatts_init();    //服务端gatt
     //sd_init();
