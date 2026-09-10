@@ -1,0 +1,19 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPathWin": "d:\\Q\\ESP32\\ESPIDF_5.5.2\\v5.5.2\\esp-idf",
+  "idf.pythonInstallPath": "d:\\Q\\ESP32\\tools_5.5.2\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.openOcdConfigs": [
+    "board/esp32-wrover-kit-3.3v.cfg"
+  ],
+  "idf.toolsPathWin": "d:\\Q\\ESP32\\tools_5.5.2",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32"
+  },
+  "clangd.path": "d:\\Q\\ESP32\\tools_5.5.2\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\Q\\ESP32\\Smart_Speaker\\build"
+  ],
+  "idf.currentSetup": "d:\\Q\\ESP32\\ESPIDF_5.5.2\\v5.5.2\\esp-idf"
+}
