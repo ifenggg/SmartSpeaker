@@ -27,10 +27,10 @@
 #define APP_RC_CT_TL_RN_PLAYBACK_CHANGE  (3)    //播放状态变化通知
 #define APP_RC_CT_TL_RN_PLAY_POS_CHANGE  (4)    //播放进度变化通知
 
-//引脚宏定义
-#define I2S_BCK_PIN     26
-#define I2S_LRCK_PIN    27  //22
-#define I2S_DATA_PIN    25
+//引脚宏定义（改用 Kconfig 配置，menuconfig 修改即可生效）
+#define I2S_BCK_PIN     CONFIG_EXAMPLE_I2S_BCK_PIN
+#define I2S_LRCK_PIN    CONFIG_EXAMPLE_I2S_LRCK_PIN
+#define I2S_DATA_PIN    CONFIG_EXAMPLE_I2S_DATA_PIN
 
 //应用层的延迟值
 #define APP_DELAY_VALUE                  50  // 5ms

@@ -42,7 +42,7 @@ void adc_init(void)
 
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, EXAMPLE_ADC2_CHAN1, &config));
 
-    do_calibration_chan1 = example_adc_calibration_init(ADC_UNIT_1, EXAMPLE_ADC2_CHAN1, EXAMPLE_ADC_ATTEN, &adc_cali_chan1_handle);
+    do_calibration_chan1 = example_adc_calibration_init(ADC_UNIT_2, EXAMPLE_ADC2_CHAN1, EXAMPLE_ADC_ATTEN, &adc_cali_chan1_handle);
 
     adc_queue = xQueueCreate(1, sizeof(uint8_t));    //创建gpio队列
 
@@ -67,10 +67,10 @@ static void adc_task(void* arg)
         // vTaskDelay(pdMS_TO_TICKS(1000));
 
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, EXAMPLE_ADC2_CHAN1, &adc_raw[0][1]));
-        ESP_LOGI(adc_TAG, "ADC%d 通道[%d]原始数据: %d", ADC_UNIT_1 + 1, EXAMPLE_ADC2_CHAN1, adc_raw[0][1]);
+        ESP_LOGI(adc_TAG, "ADC%d 通道[%d]原始数据: %d", ADC_UNIT_2 + 1, EXAMPLE_ADC2_CHAN1, adc_raw[0][1]);
         if (do_calibration_chan1) {
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_chan1_handle, adc_raw[0][1], &voltage[0][1]));
-            ESP_LOGI(adc_TAG, "ADC%d 通道[%d]校准电压: %d mV", ADC_UNIT_1 + 1, EXAMPLE_ADC2_CHAN1, voltage[0][1]);
+            ESP_LOGI(adc_TAG, "ADC%d 通道[%d]校准电压: %d mV", ADC_UNIT_2 + 1, EXAMPLE_ADC2_CHAN1, voltage[0][1]);
         }
         if(voltage[0][1]>=3200)
             battery = 100;
