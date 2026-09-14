@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "bt_app_core.h"
+#include "amp.h"
 #include "driver/i2s_std.h"
 #include "freertos/ringbuf.h"
 #include "esp_a2dp_api.h"
@@ -84,6 +85,7 @@ void bt_sleep(void)
     vTaskSuspend(s_bt_app_task_handle);
     vTaskSuspend(s_bt_i2s_task_handle); 
     write_data_sleep_flag = 0;
+    amp_set_power(false);   // 睡眠缓熄最终阶段：关断功放
     ESP_LOGI("bt_sleep", "蓝牙任务已挂起！");
 }
 
@@ -91,6 +93,7 @@ void bt_work(void)
 {
     vTaskResume(s_bt_app_task_handle);
     ESP_LOGI("bt_work", "任务已恢复！");
+    amp_set_power(true);    // 唤醒播放：开启功放
     vTaskResume(s_bt_i2s_task_handle);
     write_data_sleep_flag = 1;    
     esp_avrc_ct_send_passthrough_cmd(

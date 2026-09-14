@@ -1,4 +1,5 @@
 #include <adc.h>
+#include "amp.h"
 
 const static char *adc_TAG = "adc";
 
@@ -93,6 +94,12 @@ static void adc_task(void* arg)
         else
             battery = 0;
         ESP_LOGI("adc", "电量%d",battery);
+        // 低电量联动功放：低于阈值关断，恢复后开启
+        if (battery <= AMP_LOW_BATT_OFF) {
+            amp_set_low_batt_off(true);
+        } else if (battery >= AMP_LOW_BATT_RECOVER) {
+            amp_set_low_batt_off(false);
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
         // vTaskGetInfo(
         //     NULL,               // 传入NULL表示查询“当前任务”

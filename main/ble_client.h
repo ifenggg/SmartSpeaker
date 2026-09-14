@@ -19,18 +19,18 @@ extern "C" {
 #endif
 
 /* =====================================================================
- * 一、目标设备参数 —— 【集中配置区：请在此填充真实参数】
+ * 一、目标设备参数 —— 【集中配置区】
  * =====================================================================
  * 说明：
- *   1. 名称前缀与 UUID 至少填一项；名称前缀优先于服务 UUID。
- *   2. 128 位 UUID 采用带短横线的小写标准格式，例如：
- *        "0000fff0-0000-1000-8000-00805f9b34fb"
- *   3. 后续兼容手机端自研 BLE 从机时，仅需在此新增 / 修改宏，不改动 .c 逻辑。
+ *   1. 名称前缀与服务 UUID 至少填一项；名称前缀优先于服务 UUID。
+ *   2. 手表为固定 16 位 UUID：主服务 FFF0，特征 FFF1(写+通知)/FFF2(读+通知)/FFF3(写)。
+ *   3. 本模块当前仅用「写 + 通知」双向通道：特征1(FFF1) 同时用于 Write 与 Notify；
+ *      特征2(FFF2, Read+Notify) 与特征3(FFF3, Write) 暂未使用（预留扩展 Read）。
  * ===================================================================== */
-#define TARGET_DEV_NAME_PREFIX      ""   /* TODO[填充]：目标设备名称前缀，如 "OV-Watch"；留空则改用服务 UUID 过滤 */
-#define TARGET_SERVICE_UUID128      ""   /* TODO[填充]：目标主服务 128 位 UUID（带短横线） */
-#define WRITE_CHAR_UUID128          ""   /* TODO[填充]：可写特征 UUID（Write Without Response，音箱 → 设备） */
-#define NOTIFY_CHAR_UUID128         ""   /* TODO[填充]：通知特征 UUID（Notify，设备 → 音箱） */
+#define TARGET_DEV_NAME_PREFIX      "OV_WATCH"   /* 手表广播名称（KT6368A 透传模块，固定） */
+#define TARGET_SERVICE_UUID         0xFFF0   /* 16 位主服务 UUID（固定） */
+#define WRITE_CHAR_UUID             0xFFF1   /* 16 位写特征 UUID（特征1：Write + Notify，音箱→手表） */
+#define NOTIFY_CHAR_UUID            0xFFF1   /* 16 位通知特征 UUID（特征1：Write + Notify，手表→音箱） */
 
 /* =====================================================================
  * 二、扫描 / 连接 / 重连参数（可调）
@@ -41,6 +41,7 @@ extern "C" {
 #define BLE_CLIENT_SCAN_INTERVAL        0x50    /* 扫描间隔 = 0x50 * 0.625ms = 100ms（降低对 A2DP 的干扰） */
 #define BLE_CLIENT_SCAN_WINDOW          0x30    /* 扫描窗口 = 0x30 * 0.625ms = 60ms */
 #define BLE_CLIENT_MTU                  247     /* 请求的 MTU（Notify 大数据量时使用） */
+#define BLE_CLIENT_SCAN_LOG_ALL         1       /* 调试：打印每个扫描到的设备（名称/地址/RSSI）；排查完可置 0 */
 
 /* =====================================================================
  * 三、连接状态（ble_client_get_state 返回值）

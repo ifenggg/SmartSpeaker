@@ -124,65 +124,37 @@ static void ble_c_set_state(ble_c_state_t st)
  * 工具函数
  * --------------------------------------------------------------------- */
 
-/* 十六进制字符转数值，非法返回 -1 */
-static int hex2nibble(char c)
+/* 构造 16 位 UUID */
+static void ble_c_uuid16_set(esp_bt_uuid_t *out, uint16_t val)
 {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
+    out->len = ESP_UUID_LEN_16;
+    out->uuid.uuid16 = val;
 }
 
-/* 解析带短横线的 128 位 UUID 字符串到 esp_bt_uuid_t（ESP 小端字节序） */
-static bool uuid128_from_str(const char *str, esp_bt_uuid_t *out)
-{
-    if (str == NULL || out == NULL) {
-        return false;
-    }
-    uint8_t canon[16];
-    int n = 0;
-    for (const char *p = str; *p; p++) {
-        if (*p == '-') {
-            continue;
-        }
-        int hi = hex2nibble(*p);
-        int lo = hex2nibble(*(p + 1));
-        if (hi < 0 || lo < 0) {
-            return false;
-        }
-        if (n >= 16) {
-            return false;
-        }
-        canon[n++] = (uint8_t)((hi << 4) | lo);
-        p++;    /* 一次消费两个 hex 字符 */
-    }
-    if (n != 16) {
-        return false;
-    }
-    out->len = ESP_UUID_LEN_128;
-    for (int i = 0; i < 16; i++) {
-        out->uuid.uuid128[i] = canon[15 - i];   /* 标准序 → ESP 小端序（反转） */
-    }
-    return true;
-}
-
-/* 比较两个 UUID 是否相等 */
+/* 比较两个 UUID 是否相等（兼容 16 位与 128 位交叉比较） */
 static bool uuid_equal(const esp_bt_uuid_t *a, const esp_bt_uuid_t *b)
 {
     if (a == NULL || b == NULL) {
         return false;
     }
-    if (a->len != b->len) {
+    if (a->len == b->len) {
+        if (a->len == ESP_UUID_LEN_16) {
+            return a->uuid.uuid16 == b->uuid.uuid16;
+        }
+        if (a->len == ESP_UUID_LEN_32) {
+            return a->uuid.uuid32 == b->uuid.uuid32;
+        }
+        if (a->len == ESP_UUID_LEN_128) {
+            return memcmp(a->uuid.uuid128, b->uuid.uuid128, ESP_UUID_LEN_128) == 0;
+        }
         return false;
     }
-    if (a->len == ESP_UUID_LEN_16) {
-        return a->uuid.uuid16 == b->uuid.uuid16;
+    /* 长度不同：16 位 vs 128 位，取 128 位 UUID 的低 16 位比较 */
+    if (a->len == ESP_UUID_LEN_128 && b->len == ESP_UUID_LEN_16) {
+        return (a->uuid.uuid128[12] | (a->uuid.uuid128[13] << 8)) == b->uuid.uuid16;
     }
-    if (a->len == ESP_UUID_LEN_32) {
-        return a->uuid.uuid32 == b->uuid.uuid32;
-    }
-    if (a->len == ESP_UUID_LEN_128) {
-        return memcmp(a->uuid.uuid128, b->uuid.uuid128, ESP_UUID_LEN_128) == 0;
+    if (a->len == ESP_UUID_LEN_16 && b->len == ESP_UUID_LEN_128) {
+        return a->uuid.uuid16 == (b->uuid.uuid128[12] | (b->uuid.uuid128[13] << 8));
     }
     return false;
 }
@@ -206,45 +178,88 @@ static uint8_t *ble_c_resolve_name(uint8_t *adv, uint16_t adv_len, uint16_t scan
     return NULL;
 }
 
-/* 判断广播数据段内是否包含目标 128 位服务 UUID */
+/* 判断广播数据段内是否包含目标服务 UUID（兼容 16 位 / 128 位广播） */
 static bool ble_c_adv_has_svc_uuid(uint8_t *buf, uint16_t len)
 {
     if (!s_have_svc_uuid) {
         return false;
     }
+    uint16_t target = s_svc_uuid.uuid.uuid16;
     uint8_t found_len = 0;
-    uint8_t *p = esp_ble_resolve_adv_data_by_type(buf, len, ESP_BLE_AD_TYPE_128SRV_CMPL, &found_len);
+
+    /* 16 位服务 UUID 列表（AD 类型 0x02/0x03） */
+    uint8_t *p = esp_ble_resolve_adv_data_by_type(buf, len, ESP_BLE_AD_TYPE_16SRV_CMPL, &found_len);
+    if (p == NULL) {
+        p = esp_ble_resolve_adv_data_by_type(buf, len, ESP_BLE_AD_TYPE_16SRV_PART, &found_len);
+    }
+    if (p != NULL) {
+        for (int i = 0; i + 1 < found_len; i += 2) {
+            if ((p[i] | (p[i + 1] << 8)) == target) {
+                return true;
+            }
+        }
+    }
+
+    /* 128 位服务 UUID（AD 类型 0x06/0x07）：取低 16 位比较 */
+    p = esp_ble_resolve_adv_data_by_type(buf, len, ESP_BLE_AD_TYPE_128SRV_CMPL, &found_len);
     if (p == NULL) {
         p = esp_ble_resolve_adv_data_by_type(buf, len, ESP_BLE_AD_TYPE_128SRV_PART, &found_len);
     }
-    if (p == NULL || found_len != ESP_UUID_LEN_128) {
-        return false;
+    if (p != NULL && found_len >= ESP_UUID_LEN_128) {
+        if ((p[12] | (p[13] << 8)) == target) {
+            return true;
+        }
     }
-    return (memcmp(p, s_svc_uuid.uuid.uuid128, ESP_UUID_LEN_128) == 0);
+    return false;
 }
 
-/* 扫描结果是否匹配目标设备 */
+/* 调试：打印每个扫描到的设备（名称 / 地址 / RSSI），便于核对目标设备标识 */
+static void ble_c_dump_scan(esp_ble_gap_cb_param_t *scan)
+{
+#if BLE_CLIENT_SCAN_LOG_ALL
+    uint8_t name_len = 0;
+    uint8_t *name = ble_c_resolve_name(scan->scan_rst.ble_adv,
+                                       scan->scan_rst.adv_data_len,
+                                       scan->scan_rst.scan_rsp_len, &name_len);
+    char buf[33];
+    int n = (name != NULL && name_len < (int)sizeof(buf)) ? (int)name_len : 0;
+    if (n > 0) {
+        memcpy(buf, name, n);
+    }
+    buf[n] = '\0';
+    ESP_LOGI(TAG, "[扫描] %02x:%02x:%02x:%02x:%02x:%02x RSSI=%-4d 名称='%s'",
+             scan->scan_rst.bda[0], scan->scan_rst.bda[1], scan->scan_rst.bda[2],
+             scan->scan_rst.bda[3], scan->scan_rst.bda[4], scan->scan_rst.bda[5],
+             scan->scan_rst.rssi, (n > 0) ? buf : "(无)");
+#endif
+}
+
+/* 扫描结果是否匹配目标设备（名称前缀优先，服务 UUID 兜底） */
 static bool ble_c_scan_match(esp_ble_gap_cb_param_t *scan)
 {
     uint8_t *adv = scan->scan_rst.ble_adv;
     uint16_t adv_len = scan->scan_rst.adv_data_len;
     uint16_t scan_rsp_len = scan->scan_rst.scan_rsp_len;
 
-    /* 方式一：名称前缀过滤（优先） */
+    /* 未配置任何过滤条件：连接第一个扫描到的设备（调试用） */
+    if (TARGET_DEV_NAME_PREFIX[0] == '\0' && !s_have_svc_uuid) {
+        ESP_LOGW(TAG, "未配置名称前缀/服务 UUID，连接第一个扫描到的设备");
+        return true;
+    }
+
+    /* ① 名称前缀匹配 */
     if (TARGET_DEV_NAME_PREFIX[0] != '\0') {
         uint8_t name_len = 0;
         uint8_t *name = ble_c_resolve_name(adv, adv_len, scan_rsp_len, &name_len);
-        if (name == NULL) {
-            return false;
+        if (name != NULL) {
+            size_t plen = strlen(TARGET_DEV_NAME_PREFIX);
+            if (name_len >= plen && memcmp(name, TARGET_DEV_NAME_PREFIX, plen) == 0) {
+                return true;
+            }
         }
-        size_t plen = strlen(TARGET_DEV_NAME_PREFIX);
-        if (name_len < plen) {
-            return false;
-        }
-        return (memcmp(name, TARGET_DEV_NAME_PREFIX, plen) == 0);
     }
 
-    /* 方式二：服务 UUID 过滤 */
+    /* ② 服务 UUID 匹配（名称不匹配或解析不到时兜底） */
     if (s_have_svc_uuid) {
         if (ble_c_adv_has_svc_uuid(adv, adv_len)) {
             return true;
@@ -252,12 +267,9 @@ static bool ble_c_scan_match(esp_ble_gap_cb_param_t *scan)
         if (scan_rsp_len && ble_c_adv_has_svc_uuid(adv + adv_len, scan_rsp_len)) {
             return true;
         }
-        return false;
     }
 
-    /* 名称前缀与 UUID 都未配置：连接第一个扫描到的设备（调试用） */
-    ESP_LOGW(TAG, "未配置名称前缀/服务 UUID，将连接第一个扫描到的设备");
-    return true;
+    return false;
 }
 
 /* ---------------------------------------------------------------------
@@ -407,6 +419,14 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         ble_c_start_scan();
         break;
 
+    case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT:
+        if (param->scan_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(TAG, "扫描启动失败: 0x%x", param->scan_start_cmpl.status);
+        } else {
+            ESP_LOGI(TAG, "扫描已启动，正在搜索目标设备...");
+        }
+        break;
+
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
         if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) {
             break;
@@ -414,6 +434,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         if (ble_c_state_get() != BLE_C_STATE_SCANNING) {
             break;
         }
+        ble_c_dump_scan(param);          /* 调试：打印扫描到的设备 */
         if (!ble_c_scan_match(param)) {
             break;
         }
@@ -629,24 +650,18 @@ void ble_client_init(void)
     s_reconnect_timer = xTimerCreate("ble_reconn", pdMS_TO_TICKS(BLE_CLIENT_RECONNECT_DELAY_MS),
                                      pdFALSE, NULL, reconnect_timer_cb);
 
-    /* 解析目标 UUID（宏为空则跳过对应过滤 / 查询） */
-    if (TARGET_SERVICE_UUID128[0] != '\0') {
-        s_have_svc_uuid = uuid128_from_str(TARGET_SERVICE_UUID128, &s_svc_uuid);
-        if (!s_have_svc_uuid) {
-            ESP_LOGE(TAG, "TARGET_SERVICE_UUID128 解析失败，请检查格式");
-        }
+    /* 构造 16 位目标 UUID（宏为 0 则跳过对应过滤 / 查询） */
+    if (TARGET_SERVICE_UUID != 0) {
+        ble_c_uuid16_set(&s_svc_uuid, TARGET_SERVICE_UUID);
+        s_have_svc_uuid = true;
     }
-    if (WRITE_CHAR_UUID128[0] != '\0') {
-        s_have_write_uuid = uuid128_from_str(WRITE_CHAR_UUID128, &s_write_char_uuid);
-        if (!s_have_write_uuid) {
-            ESP_LOGE(TAG, "WRITE_CHAR_UUID128 解析失败，请检查格式");
-        }
+    if (WRITE_CHAR_UUID != 0) {
+        ble_c_uuid16_set(&s_write_char_uuid, WRITE_CHAR_UUID);
+        s_have_write_uuid = true;
     }
-    if (NOTIFY_CHAR_UUID128[0] != '\0') {
-        s_have_notify_uuid = uuid128_from_str(NOTIFY_CHAR_UUID128, &s_notify_char_uuid);
-        if (!s_have_notify_uuid) {
-            ESP_LOGE(TAG, "NOTIFY_CHAR_UUID128 解析失败，请检查格式");
-        }
+    if (NOTIFY_CHAR_UUID != 0) {
+        ble_c_uuid16_set(&s_notify_char_uuid, NOTIFY_CHAR_UUID);
+        s_have_notify_uuid = true;
     }
 
     /* 注册 GAP 与 GATTC 回调 */

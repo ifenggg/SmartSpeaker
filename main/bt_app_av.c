@@ -7,6 +7,7 @@
 
 #include "bt_app_core.h"
 #include "bt_app_av.h"
+#include "amp.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
@@ -245,6 +246,7 @@ static void volume_set_by_controller(uint8_t volume)
     _lock_acquire(&s_volume_lock);
     s_volume = volume;
     _lock_release(&s_volume_lock);
+    amp_set_mute(volume == 0);   // 音量联动：音量=0 自动静音
 }
 
 static void volume_set_by_local_host(uint8_t volume)
@@ -263,6 +265,7 @@ static void volume_set_by_local_host(uint8_t volume)
         esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_CHANGED, &rn_param);
         s_volume_notify = false;
     }
+    amp_set_mute(volume == 0);   // 音量联动：音量=0 自动静音
 }
 
 // static void volume_change_simulation(void *arg)
@@ -302,6 +305,7 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
 
             bt_i2s_driver_uninstall();  //卸载iis驱动器和相关任务
             bt_i2s_task_shut_down();
+            amp_set_power(false);   // 蓝牙断开 → 关断功放
         } 
         //连接成功
         else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED){   
@@ -335,6 +339,10 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
         //音频开始，重置音频包计数器
         if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
             s_pkt_cnt = 0;
+            amp_set_power(true);            // 音频开始 → 唤醒功放
+            amp_set_mute(s_volume == 0);    // 音量联动：0→静音
+        } else {
+            amp_power_off_delayed(AMP_PAUSE_OFF_DELAY_MS);  // 暂停/停止 → 延时关断
         }
         break;
     }
