@@ -40,7 +40,8 @@ void led_block(void)
         else if(ui_res[0]=='B')
             b = atoi(ui_res+1);
         update_led(r,g,b);
-        ESP_LOGI("leds","led颜色改为%lu,%lu,%lu",r,g,b);
+        //注意：颜色调节可能被串口屏连续拖动触发，用 LOGD 避免默认日志级别下刷屏
+        ESP_LOGD("leds","led颜色改为%lu,%lu,%lu",r,g,b);
     }
         
 }
@@ -330,7 +331,7 @@ void update_led(uint32_t red,uint32_t green,uint32_t blue)
     //发送 RGB 数据到 LED 灯带
     ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
     ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY)); //等待传输完成
-    ESP_LOGI("update_led","传输完成");
+    //注意：本函数被彩虹流动效果以 50ms 周期调用，禁止在此打印日志，否则会刷屏并拖慢音频任务
 }
 
 void leds_mo1(void)

@@ -8,6 +8,7 @@
 #include "bt_app_core.h"
 #include "bt_app_av.h"
 #include "amp.h"
+#include "audio_vol.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
@@ -94,7 +95,8 @@ static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;
                                              //AVRC目标通知功能位掩码
 static _lock_t s_volume_lock;
 static TaskHandle_t s_vcs_task_hdl = NULL;    //处理音量变化模拟任务的句柄
-uint8_t s_volume = 0;                 //本地音量值
+uint8_t s_volume = 0x7f;              //手机绝对音量（AVRCP 上报值）；初值给最大，
+                                      //避免向手机回送 0 时把手机侧音量一并清零
 static bool s_volume_notify;                 //通知音量变化与否
 #ifndef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
 i2s_chan_handle_t tx_chan = NULL;
@@ -241,12 +243,21 @@ void bt_i2s_driver_uninstall(void)
 
 static void volume_set_by_controller(uint8_t volume)
 {
-    ESP_LOGI(BT_RC_TG_TAG, "Volume is set by remote controller to: %"PRIu32"%%", (uint32_t)volume * 100 / 0x7f);
     //设置锁保护中的音量
     _lock_acquire(&s_volume_lock);
     s_volume = volume;
     _lock_release(&s_volume_lock);
-    amp_set_mute(volume == 0);   // 音量联动：音量=0 自动静音
+
+    /* 上报给软件音量模块：模式B（AUDIO_USE_REMOTE_VOL=1）下由本机代手机执行衰减，
+     * 手机音量条才能生效；若该机型自己做数字衰减（模式A），把宏改回 0 即可，避免双重衰减。 */
+    audio_vol_set_remote(volume);
+
+    ESP_LOGI(BT_RC_TG_TAG, "AVRC 收到设置音量: %"PRIu32"%% -> 总衰减 %.1fdB (增益 %"PRIu32"/32768)",
+             (uint32_t)volume * 100 / 0x7f, (double)audio_vol_get_db(), audio_vol_get_gain_q15());
+
+    /* 静音判据统一改为"本机音量"：原实现用 s_volume 判断，而 s_volume 初值为 0，
+     * 手机未上报绝对音量前会把功放永久静音（既有缺陷）。 */
+    amp_set_mute(audio_vol_get() == 0);
 }
 
 static void volume_set_by_local_host(uint8_t volume)
@@ -258,6 +269,9 @@ static void volume_set_by_local_host(uint8_t volume)
     s_volume = volume;
     _lock_release(&s_volume_lock);
 
+    //本机音量 → 数字衰减（与串口屏 bt_vo() 走同一条通路）
+    audio_vol_set(volume);
+
     //向远程AVRCP控制器发送通知响应
     if (s_volume_notify) {
         esp_avrc_rn_param_t rn_param;
@@ -265,7 +279,7 @@ static void volume_set_by_local_host(uint8_t volume)
         esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_CHANGED, &rn_param);
         s_volume_notify = false;
     }
-    amp_set_mute(volume == 0);   // 音量联动：音量=0 自动静音
+    amp_set_mute(audio_vol_get() == 0);   // 音量联动：本机音量=0 自动静音
 }
 
 // static void volume_change_simulation(void *arg)
@@ -340,7 +354,7 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
         if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
             s_pkt_cnt = 0;
             amp_set_power(true);            // 音频开始 → 唤醒功放
-            amp_set_mute(s_volume == 0);    // 音量联动：0→静音
+            amp_set_mute(audio_vol_get() == 0);    // 音量联动：本机音量=0→静音
         } else {
             amp_power_off_delayed(AMP_PAUSE_OFF_DELAY_MS);  // 暂停/停止 → 延时关断
         }

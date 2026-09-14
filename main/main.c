@@ -12,6 +12,7 @@
 #include "ble_client.h"
 #include "ble_debug.h"
 #include "amp.h"
+#include "audio_vol.h"
 #include "led_strip.h"
 #include "uart.h"
 #include "sd.h"
@@ -40,6 +41,30 @@ typedef struct {
     CommandHandler handler;    // 对应的处理函数
     size_t cmd_len;            // 命令长度（提前计算，优化效率）
 } CommandMap;
+/* =====================================================================
+ * 串口屏接口说明（本文件只负责"分发"，具体命令格式由串口屏工程决定）
+ * ---------------------------------------------------------------------
+ * 接收链路：uart.c 的 rx_task 把串口屏发来的可打印 ASCII 过滤后写入 ui_res[10]，
+ *          由本文件的 process_command() 分发。
+ *
+ * 一、前缀命令（先判首字符，可带参数）
+ *     'V' + 0..127        → 本机音量，交 bt_vo()           例："V100"
+ *     'R'/'G'/'B' + 数值  → 氛围灯颜色，交 led_block()      例："R255"
+ *
+ * 二、映射表命令（整串精确匹配，见下表 commandMap）
+ *     "bt" / "tb"          切换蓝牙页/其他页
+ *     "bton" / "btoff"     蓝牙开 / 关
+ *     "btpau" / "btpla"    蓝牙暂停 / 播放
+ *     "btne" / "btla"      下一首 / 上一首
+ *     "btsil" / "btnoi"    静音 / 开声（本机音量 0 / 恢复）
+ *     "sdon"/"sdoff"/"sdpau"/"sdpla"/"sdne"/"sdla"   SD 卡播放控制
+ *     "ledon"/"ledoff"/"ledreon"/"led1"/"led2"       氛围灯控制
+ *
+ * 三、扩展方式
+ *     定长命令   → 在 commandMap 里增加一行 { "命令串", 处理函数, strlen("命令串") }
+ *     变长命令   → 仿照上面 'V' 的写法，在 process_command() 里增加一个首字符分支
+ * ===================================================================== */
+
 //初始化指令映射表
 static const CommandMap commandMap[] = {
     {"bt",     bt_page,         strlen("bt")},
@@ -163,23 +188,29 @@ void app_main(void)
 {
     uart_2_init();  //串口屏通讯
     amp_init();     //PAM8403 功放初始化（静音/电源控制，防开机爆音）
+    audio_vol_init();   //软件音量级配初始化（必须在蓝牙起流之前，用于消除大音量炸音）
     bt_init();      //蓝牙双模开启(总开关)
     bt_a2dp_work();     //蓝牙播放功能(经典蓝牙)
-    //ble_client_init();  //BLE GATT Client（主机模式，连接OV-Watch手表）—— 替代原 BLE Server 逻辑
-    //ble_debug_start();  //BLE 双向通信调试：打印接收帧 + 周期发送 $PING,<序号>
-    //ble_gatt_init();  //gatt协议(ble蓝牙) —— 原 BLE Server 初始化，已废弃（见 ble_client.c）
+    
+    ble_client_init();  //BLE GATT Client（主机模式，连接OV-Watch手表）—— 替代原 BLE Server 逻辑
+    ble_debug_start();  //BLE 双向通信调试：打印接收帧 + 周期发送 $PING,<序号>
+    
+    //leds_init();
+    //leds_mo1();
+    key_init();
+    xTaskCreate(key_scan, "key_scan", 2048, NULL, 10, NULL);      //创建key扫描任务
+//              入口函数 终端显示函数名 栈深  参数 优先级 句柄
+
+    // ble_gatt_init();  //gatt协议(ble蓝牙) —— 原 BLE Server 初始化，已废弃（见 ble_client.c）
     // ble_gattc_init();    //客户端gatt
     // ble_gatts_init();    //服务端gatt
     //sd_init();
     //adc_init();      //ADC 电量检测（低电量联动功放）
-    leds_init();
-    key_init();
-    xTaskCreate(key_scan, "key_scan", 2048, NULL, 10, NULL);      //创建key扫描任务
-//              入口函数 终端显示函数名 栈深  参数 优先级 句柄
+
     while(1)
     {   
+        process_command(ui_res);    //启动命令分发（串口屏音量/氛围灯命令由此生效）
+        memset(ui_res, 0, sizeof(ui_res));
         vTaskDelay(500 / portTICK_PERIOD_MS);
-        // process_command(ui_res);    //启动命令分发
-        // memset(ui_res, 0, sizeof(ui_res));
     }
 }

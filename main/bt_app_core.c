@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "bt_app_core.h"
 #include "amp.h"
+#include "audio_vol.h"
 #include "driver/i2s_std.h"
 #include "freertos/ringbuf.h"
 #include "esp_a2dp_api.h"
@@ -104,11 +105,23 @@ void bt_work(void)
     ESP_LOGI("bt_work", "蓝牙任务已恢复！");
 }
 
+/* =====================================================================
+ * 串口屏音量接口
+ *   命令格式： ui_res = "V<0..127>"，例如 "V100" = 音量 100
+ *   分发位置： main.c 的 process_command() → ui_res[0]=='V' 分支
+ *   说明：     实际的增益换算与限幅在 audio_vol.c，本函数只负责解析与转交。
+ * ===================================================================== */
 void bt_vo(void)
 {
-    uint8_t vo=atoi(ui_res+1);
-    ESP_LOGI("bt","音量设置为：%d",vo);
-    //volume_set_by_local_host(vo);
+    int vo = atoi(ui_res + 1);
+    if (vo < 0) {
+        vo = 0;
+    }
+    if (vo > AUDIO_VOL_MAX) {
+        vo = AUDIO_VOL_MAX;
+    }
+    audio_vol_set((uint8_t)vo);
+    ESP_LOGI("bt", "串口屏音量设置为: %d (总衰减 %.1fdB)", vo, (double)audio_vol_get_db());
 }
 void bt_ne(void)
 {
@@ -118,12 +131,20 @@ void bt_la(void)
 {
     ESP_LOGI("bt","上一首");
 }
+/* 静音/开声：静音前记住当前音量，开声时恢复到该音量（而不是一律恢复到最大） */
+static uint8_t s_vol_before_mute = AUDIO_VOL_MAX;
 void bt_sli(void)
 {
+    uint8_t cur = audio_vol_get();
+    if (cur != 0) {
+        s_vol_before_mute = cur;
+    }
+    audio_vol_set(0);
     ESP_LOGI("bt","静音");
 }
 void bt_noi(void)
 {
+    audio_vol_set(s_vol_before_mute ? s_vol_before_mute : AUDIO_VOL_MAX);
     ESP_LOGI("bt","开声");
 }
 
@@ -207,6 +228,15 @@ static void bt_i2s_task_handler(void *arg)
                     ESP_LOGI(BT_APP_CORE_TAG, "环缓冲区下溢! 等待数据: RINGBUFFER_MODE_PREFETCHING");
                     ringbuffer_mode = RINGBUFFER_MODE_PREFETCHING;
                     break;
+                }
+
+                /* ★ 消除炸音的关键一步 ★
+                 * 数字音量级配 + 饱和限幅：把 PCM5102A 的 2.1Vrms 满刻度压进 PAM8403 的线性输入区
+                 * （5V/4Ω 下不得超过约 0.19Vrms），等价于"把功放电位器扭到安全位置"。
+                 * 16bit 交错立体声一帧 = 4 字节，先按 4 字节对齐裁剪，避免把一帧切两半。 */
+                size_t gain_bytes = item_size & ~((size_t)0x3);
+                if (gain_bytes) {
+                    audio_apply_gain_i16((int16_t *)data, gain_bytes >> 1);
                 }
 
             #ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC     //内部DAC

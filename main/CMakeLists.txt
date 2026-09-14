@@ -1,4 +1,4 @@
-idf_component_register(SRCS "amp.c" "ble_client.c" "ble_debug.c" "adc.c" "sd.c" "uart.c" "led_strip.c" "ble.c" "bt_app_av.c"
+idf_component_register(SRCS "amp.c" "audio_vol.c" "ble_client.c" "ble_debug.c" "adc.c" "sd.c" "uart.c" "led_strip.c" "ble.c" "bt_app_av.c"
                             "bt_app_core.c"
                             "main.c"
                             "bt_a2dp.c"

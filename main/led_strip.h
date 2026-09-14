@@ -5,9 +5,9 @@
 #include <uart.h>
 
 #define RMT_LED_STRIP_RESOLUTION_HZ 10000000 // 10MHz分辨率，1个时钟周期=0.1微秒 （LED灯带需要高分辨率）
-#define RMT_LED_STRIP_GPIO_NUM      13
+#define RMT_LED_STRIP_GPIO_NUM      33
 
-#define EXAMPLE_LED_NUMBERS         60
+#define EXAMPLE_LED_NUMBERS         30
 #define EXAMPLE_CHASE_SPEED_MS      100
 
 #ifdef __cplusplus

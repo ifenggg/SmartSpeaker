@@ -15,5 +15,7 @@
     "--query-driver=**",
     "--compile-commands-dir=d:\\Q\\ESP32\\Smart_Speaker\\build"
   ],
-  "idf.currentSetup": "d:\\Q\\ESP32\\ESPIDF_5.5.2\\v5.5.2\\esp-idf"
+  "idf.currentSetup": "d:\\Q\\ESP32\\ESPIDF_5.5.2\\v5.5.2\\esp-idf",
+  "idf.portWin": "COM21",
+  "idf.flashType": "UART"
 }
