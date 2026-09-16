@@ -1,4 +1,23 @@
-#include <ble.h>
+/**
+ * @file ble.c
+ * @brief 【已废弃 / 已移出编译】早期 BLE 服务端 + 客户端示例实现
+ *
+ * ⚠ 本文件当前**不参与编译**（见 main/CMakeLists.txt）。
+ *
+ * 废弃原因：
+ *   1. 本文件内部的 ble_gatt_init() 会再次注册 BLE GAP 回调，而 Bluedroid 只保存一个 GAP 回调
+ *      （esp_ble_gap_register_callback → btc_profile_cb_set，覆盖式赋值），会把 ble_client/ble_server
+ *      注册的回调顶掉，造成"扫不到/收不到广播完成事件"这类隐蔽故障；
+ *   2. 它会注册额外的 GATTS/GATTC 应用，并调用 esp_ble_gap_config_local_privacy(true) 把本地地址
+ *      切成 RPA，与"显式使用公共地址 + 显式地址类型"的建链策略冲突（0x3e 排查项之一）；
+ *   3. 功能已由下列模块替代：
+ *        ble_gap.c    —— GAP 事件统一分发（唯一系统回调）
+ *        ble_server.c —— BLE 从机（手机 BLE 调试助手接入，GATT Server）
+ *        ble_client.c —— BLE 主机（扫描并连接手表，GATT Client）
+ *
+ * 如需查阅历史实现请使用 git 历史（提交 5285f9f 等），不要重新加入编译。
+ */
+#if 0   /* 整文件停用：保留源码便于对照，避免与 ble_gap/ble_server/ble_client 冲突 */
 
 /* 本地设备名称 */
 #define BLE_ADV_NAME                "speaker-BLE"
@@ -1124,3 +1143,5 @@ void ble_gattc_init(void)
     }
     ESP_LOGI("BLE客户端:", "已开启");
 }
+
+#endif  /* 整文件停用（见文件头说明） */

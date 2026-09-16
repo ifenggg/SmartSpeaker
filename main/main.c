@@ -7,10 +7,10 @@
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include <bt_a2dp.h>
-#include <ble.h>
 #include "ble_client.h"
-#include "ble_debug.h"
+// #include "ble_debug.h"   // 【调试阶段代码，已停用】调试帧收发模块（见 main/ble_debug.c 顶部说明）
 #include "amp.h"
 #include "audio_vol.h"
 #include "led_strip.h"
@@ -27,7 +27,6 @@
 */
 extern char ui_res[10];
 extern uint8_t s_volume;    //音箱音量
-extern uint8_t sendflag;
 
 /* *************
     类状态机处理UI
@@ -184,6 +183,29 @@ static void key_scan(void* arg)
     }
 }
 
+#if 0   /* ===================== 【调试阶段代码，已停用】 =====================
+ * HCI 取证模式：调试"手表不应答（reason=0x3e / 0x08）"时用过。
+ * 需要时把下面的 #if 0 改成 #if CONFIG_BT_HCI_LOG_DEBUG_EN，
+ * 并在 menuconfig → Component config → Bluetooth → [x] Enable Bluetooth HCI debug mode。
+ * 打开后本任务每秒把 HCI 数据流打印到串口：
+ *   1) 串口重定向：idf.py -p COM21 monitor | Tee-Object all_log.txt
+ *   2) 转 btsnoop：python tools/bt/bt_hci_to_btsnoop.py -p all_log.txt -o watch --has-ts
+ *   3) Wireshark 打开 parsed_log_watch.btsnoop.log，看 LE Create Connection 参数与是否收到
+ *      LE Connection Complete（无回包 = 对端不应答）。
+ * ==================================================================== */
+extern void bt_hci_log_hci_data_show(void);
+extern void bt_hci_log_hci_adv_show(void);
+
+static void hci_log_dump_task(void *arg)
+{
+    while (1) {
+        bt_hci_log_hci_data_show();
+        bt_hci_log_hci_adv_show();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+#endif  /* ==================== 调试阶段代码结束 ==================== */
+
 void app_main(void)
 {
     uart_2_init();  //串口屏通讯
@@ -191,21 +213,24 @@ void app_main(void)
     audio_vol_init();   //软件音量级配初始化（必须在蓝牙起流之前，用于消除大音量炸音）
     bt_init();      //蓝牙双模开启(总开关)
     bt_a2dp_work();     //蓝牙播放功能(经典蓝牙)
-    
-    ble_client_init();  //BLE GATT Client（主机模式，连接OV-Watch手表）—— 替代原 BLE Server 逻辑
-    ble_debug_start();  //BLE 双向通信调试：打印接收帧 + 周期发送 $PING,<序号>
-    
+
+    ble_client_init();  //BLE GATT Client（主机）：扫描并连接手表 OV_WATCH（服务 0xFFF0 / 特征 0xFFF1）
+    // ble_debug_start();  //【调试阶段代码，已停用】连上后每 5 秒发 $PING,<序号> 并打印收到的帧
+
     //leds_init();
     //leds_mo1();
     key_init();
     xTaskCreate(key_scan, "key_scan", 2048, NULL, 10, NULL);      //创建key扫描任务
 //              入口函数 终端显示函数名 栈深  参数 优先级 句柄
 
-    // ble_gatt_init();  //gatt协议(ble蓝牙) —— 原 BLE Server 初始化，已废弃（见 ble_client.c）
-    // ble_gattc_init();    //客户端gatt
-    // ble_gatts_init();    //服务端gatt
-    //sd_init();
-    //adc_init();      //ADC 电量检测（低电量联动功放）
+#if 0   /* 【调试阶段代码，已停用】HCI 调试模式的任务启动 */
+    xTaskCreate(hci_log_dump_task, "hci_dump", 3072, NULL, 3, NULL);
+    ESP_LOGW("esp", "已开启 HCI 调试模式：串口会持续打印 HCI 数据（排查链路层问题用）");
+#endif
+
+    // 说明：音箱在本工程中**只作 BLE 主机**，连接手表；
+    //       BLE 侧调试代码（main/ble_debug.c、HCI 取证）、手机从机反向方案
+    //       （main/ble_server.c）与早期示例（main/ble.c）均已停用/移出编译，源码保留备查。
 
     while(1)
     {   

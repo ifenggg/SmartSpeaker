@@ -69,7 +69,7 @@ void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     case ESP_BT_GAP_AUTH_CMPL_EVT: {
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
             ESP_LOGI(BT_AV_TAG, "身份验证成功: %s", param->auth_cmpl.device_name);
-            esp_log_buffer_hex(BT_AV_TAG, param->auth_cmpl.bda, ESP_BD_ADDR_LEN);
+            ESP_LOG_BUFFER_HEX(BT_AV_TAG, param->auth_cmpl.bda, ESP_BD_ADDR_LEN);
         } else {
             ESP_LOGE(BT_AV_TAG, "authentication failed, status: %d", param->auth_cmpl.stat);
         }
@@ -138,7 +138,8 @@ void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
     //蓝牙协议栈完成
     case BT_APP_EVT_STACK_UP: {
         esp_bt_gap_set_device_name(LOCAL_DEVICE_NAME);
-        esp_ble_gap_set_device_name(LOCAL_DEVICE_NAME);
+        /* 注意：BLE 侧名称由 ble_client.c 设置（BLE_CLIENT_LOCAL_NAME），
+         * 这里只设经典蓝牙名称，避免两边互相覆盖。 */
         esp_bt_dev_register_callback(bt_app_dev_cb);
         esp_bt_gap_register_callback(bt_app_gap_cb);
 
