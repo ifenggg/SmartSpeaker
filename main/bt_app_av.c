@@ -22,6 +22,8 @@
 
 #include "sys/lock.h"
 
+#include "ui.h"     /* 串口屏界面状态：当前页判断 + 状态推送 */
+
 //AVRCP（音视频远程控制协议）使用的事务标签
 #define APP_RC_CT_TL_GET_CAPS            (0)    //标识 AVRCP 控制器发起的 “获取对方设备能力” 操作
 #define APP_RC_CT_TL_GET_META_DATA       (1)    //获取当前播放音频的标题、艺术家等元数据
@@ -76,7 +78,6 @@ uint8_t write_data_sleep_flag = 1;
 uint8_t bt_con_flag;
 esp_bd_addr_t g_connected_bda = {0}; // 初始化为全0（表示未连接）
 extern TaskHandle_t s_bt_i2s_task_handle;  /* 创建I2S任务句柄  */
-extern bool btpage;
 
 /*******************************
  * STATIC VARIABLE 定义
@@ -85,6 +86,7 @@ extern bool btpage;
 static uint32_t s_pkt_cnt = 0;               //计数音频包
 static uint32_t pos = 0;        //实时播放进度
 uint32_t total_pos = 1;             //歌曲总时长（赋初值，避免除以零引起系统复位）
+static uint8_t  s_progress = 0;     //播放进度百分比（0-100），供串口屏切页后补发
 static esp_a2d_audio_state_t s_audio_state = ESP_A2D_AUDIO_STATE_STOPPED;
                                              //音频流数据路径状态
 static const char *s_a2d_conn_state_str[] = {"已断开连接","正在连接","已连接","正在断开连接"};
@@ -175,9 +177,12 @@ static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *even
         pos = event_parameter->play_pos;
         if(total_pos)
         {
-            uint8_t per = (pos * 100)/total_pos;
-            ESP_LOGI(BT_RC_CT_TAG, "播放进度：%"PRIu8, per);
-            uart_send("j0.val=%u",per);
+            s_progress = (uint8_t)((pos * 100) / total_pos);
+            ESP_LOGI(BT_RC_CT_TAG, "播放进度：%"PRIu8, s_progress);
+            /* 只有屏幕停在蓝牙页才推送（进度条控件是页面私有，切页后由 ui 层补发） */
+            if (ui_get_page() == UI_PAGE_BT) {
+                ui_push_bt_play_state();
+            }
         }
         bt_av_play_pos_changed();
         break;
@@ -190,6 +195,11 @@ static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *even
 
 void bt_i2s_driver_install(void)
 {
+    /* 幂等保护：已经安装过就不再重复创建（重复安装会失败并触发断言复位） */
+    if (tx_chan != NULL) {
+        ESP_LOGW(BT_AV_TAG, "I2S 驱动已安装，跳过重复安装");
+        return;
+    }
 #ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
     dac_continuous_config_t cont_cfg = {
         .chan_mask = DAC_CHANNEL_MASK_ALL,
@@ -232,6 +242,12 @@ void bt_i2s_driver_install(void)
 
 void bt_i2s_driver_uninstall(void)
 {
+    /* 幂等保护：未安装（或已卸载）时直接返回。
+     * 旧代码在"断开连接"与"关蓝牙"两处都会卸载，第二次对已删除的通道操作会触发断言复位。 */
+    if (tx_chan == NULL) {
+        ESP_LOGW(BT_AV_TAG, "I2S 驱动未安装，跳过卸载");
+        return;
+    }
 #ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
     ESP_ERROR_CHECK(dac_continuous_disable(tx_chan));
     ESP_ERROR_CHECK(dac_continuous_del_channels(tx_chan));
@@ -239,6 +255,19 @@ void bt_i2s_driver_uninstall(void)
     ESP_ERROR_CHECK(i2s_channel_disable(tx_chan));
     ESP_ERROR_CHECK(i2s_del_channel(tx_chan));
 #endif
+    tx_chan = NULL;
+}
+
+/* ============================ 状态查询（供串口屏） ============================ */
+
+bool bt_a2d_is_playing(void)
+{
+    return (s_audio_state == ESP_A2D_AUDIO_STATE_STARTED);
+}
+
+uint8_t bt_a2d_get_progress(void)
+{
+    return s_progress;
 }
 
 static void volume_set_by_controller(uint8_t volume)
@@ -311,8 +340,8 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
         //断开连接
         if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);  //设置蓝牙为可连接和可发现模式
-            if(btpage==1)
-                uart_send("t1.txt=\"未连接\"");
+            if(ui_get_page() == UI_PAGE_BT)
+                ui_push_bt_conn_state();
             // s_audio_state = ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND;
             // s_pkt_cnt = 0;  // 重置数据包计数
             // s_avrc_peer_rn_cap.bits = 0;    //清除对等方通知能力记录
@@ -320,6 +349,7 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             bt_i2s_driver_uninstall();  //卸载iis驱动器和相关任务
             bt_i2s_task_shut_down();
             amp_set_power(false);   // 蓝牙断开 → 关断功放
+            bt_con_flag = 0;        // 【修复】断开后清零连接标志，否则后续"关蓝牙"会重复反初始化 I2S
         } 
         //连接成功
         else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED){   
@@ -328,8 +358,8 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             vTaskResume(s_bt_i2s_task_handle);
             write_data_sleep_flag = 1;
             bt_con_flag = 1;
-            if(btpage==1)
-                uart_send("t1.txt=\"已连接\"");
+            if(ui_get_page() == UI_PAGE_BT)
+                ui_push_bt_conn_state();
         } 
         //连接中。。。
         else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING) {
@@ -341,15 +371,11 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
     case ESP_A2D_AUDIO_STATE_EVT: {
         a2d = (esp_a2d_cb_param_t *)(p_param);
         ESP_LOGI(BT_AV_TAG, "A2DP 音频状态: %s", s_a2d_audio_state_str[a2d->audio_stat.state]);
-        if(a2d->audio_stat.state)
-        {
-            uart_send("b1.picc=7");
-        }
-        if(a2d->audio_stat.state==0)
-        {
-            uart_send("b1.picc=6");
-        }
         s_audio_state = a2d->audio_stat.state;
+        /* 播放/暂停图标只在屏幕停在蓝牙页时推送（切页后由 ui 层补发） */
+        if (ui_get_page() == UI_PAGE_BT) {
+            ui_push_bt_play_state();
+        }
         //音频开始，重置音频包计数器
         if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
             s_pkt_cnt = 0;
@@ -492,22 +518,23 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
     }
     //元数据的响应
     case ESP_AVRC_CT_METADATA_RSP_EVT: {
-        uint8_t medata_flag = 0;
         ESP_LOGI(BT_RC_CT_TAG, "AVRC 元数据响应: 属性ID 0x%x, %s", rc->meta_rsp.attr_id, rc->meta_rsp.attr_text);
-        if(rc->meta_rsp.attr_id == 0x1||medata_flag==0)
+        /* 旧实现里 medata_flag 恒为 0，导致任何属性都会覆盖 t2.txt；
+         * 现在按 AVRCP 属性号分发：0x1=TITLE（曲名），0x2=ARTIST（歌手）。
+         * ui 层会缓存这两个文本，屏幕切回蓝牙页时用缓存补发。 */
+        if(rc->meta_rsp.attr_id == 0x1)
         {
-            uart_send("t2.txt=\"%s\"",rc->meta_rsp.attr_text);
-            medata_flag = 1;
+            ui_push_bt_track_text((const char *)rc->meta_rsp.attr_text, NULL);
         }
-        if(rc->meta_rsp.attr_id == 0x2)
+        else if(rc->meta_rsp.attr_id == 0x2)
         {
-            uart_send("t5.txt=\"%s\"",rc->meta_rsp.attr_text);
+            ui_push_bt_track_text(NULL, (const char *)rc->meta_rsp.attr_text);
         }
-        if(rc->meta_rsp.attr_id == 0x40)
+        else if(rc->meta_rsp.attr_id == 0x40)
         {
             total_pos = atoi((const char *)rc->meta_rsp.attr_text);
-            // uint8_t per = (pos * 100)/total_pos;
-            // ESP_LOGI(BT_RC_CT_TAG, "AVRC 元数据响应: 播放进度：%d", per);
+            // s_progress = (pos * 100)/total_pos;
+            // ESP_LOGI(BT_RC_CT_TAG, "AVRC 元数据响应: 播放进度：%d", s_progress);
         }
         free(rc->meta_rsp.attr_text);
         break;

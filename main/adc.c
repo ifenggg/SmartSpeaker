@@ -1,5 +1,6 @@
 #include <adc.h>
 #include "amp.h"
+#include "ui.h"     /* 电量推送接口（本阶段已停用：串口屏电量固定 60，见下方 adc_task 注释） */
 
 const static char *adc_TAG = "adc";
 
@@ -56,8 +57,12 @@ void adc_init(void)
 static void adc_task(void* arg)
 {
     //TaskStatus_t task_status;  // 保存任务状态的结构体
+    bool first_round = true;    // 开机首轮：先快速测一次电量，让屏幕右上角尽快有数
+
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(60000));   //一分钟执行一次电量检测
+        /* 开机 3 秒后先测一次，之后每分钟测一次 */
+        vTaskDelay(pdMS_TO_TICKS(first_round ? 3000 : 60000));
+        first_round = false;
 
         // ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, EXAMPLE_ADC2_CHAN0, &adc_raw[0][0]));
         // ESP_LOGI(adc_TAG, "ADC%d 通道[%d]原始数据: %d", ADC_UNIT_1 + 1, EXAMPLE_ADC2_CHAN0, adc_raw[0][0]);
@@ -94,6 +99,11 @@ static void adc_task(void* arg)
         else
             battery = 0;
         ESP_LOGI("adc", "电量%d",battery);
+        /* 【本阶段停用】按要求：不能初始化 ADC、也不能调用 ADC 电量采集。
+         * 串口屏显示的电量固定为 60（见 main/ui.c 的 s_battery 初值），
+         * 因此这里不再把 ADC 结果推给屏幕。
+         * 硬件确认（电池分压接到 GPIO14 / ADC2_CH6）后，恢复下面这一行即可。 */
+        // ui_set_battery(battery);
         // 低电量联动功放：低于阈值关断，恢复后开启
         if (battery <= AMP_LOW_BATT_OFF) {
             amp_set_low_batt_off(true);

@@ -10,6 +10,7 @@
 #include "bt_app_core.h"
 #include "amp.h"
 #include "audio_vol.h"
+#include "uart.h"       /* ui_res：串口屏命令缓冲（bt_vo 解析音量时读取） */
 #include "driver/i2s_std.h"
 #include "freertos/ringbuf.h"
 #include "esp_a2dp_api.h"
@@ -20,7 +21,6 @@
 #define RINGBUF_PREFETCH_WATER_LEVEL   (20 * 1024)  //开始播放的数据量阈值
 
 extern esp_bd_addr_t g_connected_bda; // 初始化为全0（表示未连接）
-extern char ui_res[10];
 
 enum {
     RINGBUFFER_MODE_PROCESSING,    //正常播放状态
@@ -64,45 +64,59 @@ extern dac_continuous_handle_t tx_chan; //// 使用内部DAC
 /*******************************
  * 自定义函数定义
  ******************************/
-bool btpage;
-void bt_page(void)
-{
-    if(ui_res[0]=='b'&& ui_res[1]=='t')
-    {
-        btpage = 1;
-    }
-    if(ui_res[0]=='t'&& ui_res[1]=='b')
-    {
-        btpage = 0;
-    }
-}
+/* 播放/暂停（btpau/btpla）属于"调度级"开关，不是初始化/反初始化。
+ *
+ * 【本轮整改】按串口屏要求：这两个命令必须与手机用 AVRCP 同步，但**不再挂起蓝牙/I2S 任务**。
+ *   原因：挂起后收不到手机端事件，用户在手机上点"播放"时音箱不会跟随（会静音不同步）；
+ *         而且旧实现在未连接手机时 s_bt_i2s_task_handle == NULL，
+ *         vTaskSuspend(NULL) 挂起的是**调用者自己**（分发串口屏命令的 ui_task），
+ *         会导致"按一次暂停后串口屏全部命令都没反应"。
+ *   现在只做两件事：① 发 AVRCP 暂停/播放；② 立即关/开功放。任务始终运行。
+ */
+static bool s_bt_paused = false;
+
 void bt_sleep(void)
 {
+    s_bt_paused = true;
+    amp_set_power(false);           // 暂停：立即关断功放（静音且省电）
+    /* 保持接收音频（write_data_sleep_flag = 1）：手机上再点播放时音箱能立刻跟随 */
+    write_data_sleep_flag = 1;
     esp_avrc_ct_send_passthrough_cmd(
             0,
         ESP_AVRC_PT_CMD_PAUSE,
         ESP_AVRC_PT_CMD_STATE_PRESSED
     );
-    vTaskSuspend(s_bt_app_task_handle);
-    vTaskSuspend(s_bt_i2s_task_handle); 
-    write_data_sleep_flag = 0;
-    amp_set_power(false);   // 睡眠缓熄最终阶段：关断功放
-    ESP_LOGI("bt_sleep", "蓝牙任务已挂起！");
+    ESP_LOGI("bt_sleep", "已发送 AVRCP 暂停并关断功放（任务不挂起，保持与手机同步）");
 }
 
 void bt_work(void)
 {
-    vTaskResume(s_bt_app_task_handle);
-    ESP_LOGI("bt_work", "任务已恢复！");
-    amp_set_power(true);    // 唤醒播放：开启功放
-    vTaskResume(s_bt_i2s_task_handle);
-    write_data_sleep_flag = 1;    
+    s_bt_paused = false;
+    amp_set_power(true);            // 播放：开启功放
+    write_data_sleep_flag = 1;
     esp_avrc_ct_send_passthrough_cmd(
             1,
         ESP_AVRC_PT_CMD_PLAY,
         ESP_AVRC_PT_CMD_STATE_PRESSED
     );
-    ESP_LOGI("bt_work", "蓝牙任务已恢复！");
+    ESP_LOGI("bt_work", "已发送 AVRCP 播放并开启功放");
+}
+
+/* 供蓝牙反初始化（关蓝牙）复用：把可能被挂起的任务恢复回可调度状态 */
+void bt_tasks_resume(void)
+{
+    if (s_bt_app_task_handle) {
+        vTaskResume(s_bt_app_task_handle);
+    }
+    if (s_bt_i2s_task_handle) {
+        vTaskResume(s_bt_i2s_task_handle);
+    }
+    s_bt_paused = false;
+}
+
+bool bt_is_paused(void)
+{
+    return s_bt_paused;
 }
 
 /* =====================================================================
@@ -126,13 +140,16 @@ void bt_vo(void)
 void bt_ne(void)
 {
     ESP_LOGI("bt","下一首");
+    /* 通过 AVRCP 把"下一曲"透传给手机（事务标签 2，与暂停/播放的 0/1 区分开） */
+    esp_avrc_ct_send_passthrough_cmd(2, ESP_AVRC_PT_CMD_FORWARD, ESP_AVRC_PT_CMD_STATE_PRESSED);
 }
 void bt_la(void)
 {
     ESP_LOGI("bt","上一首");
+    esp_avrc_ct_send_passthrough_cmd(3, ESP_AVRC_PT_CMD_BACKWARD, ESP_AVRC_PT_CMD_STATE_PRESSED);
 }
 /* 静音/开声：静音前记住当前音量，开声时恢复到该音量（而不是一律恢复到最大） */
-static uint8_t s_vol_before_mute = AUDIO_VOL_MAX;
+static uint8_t s_vol_before_mute = AUDIO_VOL_DEFAULT;
 void bt_sli(void)
 {
     uint8_t cur = audio_vol_get();
@@ -144,7 +161,7 @@ void bt_sli(void)
 }
 void bt_noi(void)
 {
-    audio_vol_set(s_vol_before_mute ? s_vol_before_mute : AUDIO_VOL_MAX);
+    audio_vol_set(s_vol_before_mute ? s_vol_before_mute : AUDIO_VOL_DEFAULT);
     ESP_LOGI("bt","开声");
 }
 
@@ -288,6 +305,12 @@ bool bt_app_work_dispatch(bt_app_cb_t p_cback, uint16_t event, void *p_params, i
 //任务启动函数
 void bt_app_task_start_up(void)
 {
+    /* 幂等：初始化只做一次（初始化已在上电由 bt_init()/bt_a2dp_work() 完成，
+     * 重复创建会多出一个任务和一条队列，旧代码在"关蓝牙后再开"时就会重复创建） */
+    if (s_bt_app_task_handle != NULL) {
+        ESP_LOGI(BT_APP_CORE_TAG, "蓝牙应用任务已存在，跳过重复创建");
+        return;
+    }
     s_bt_app_task_queue = xQueueCreate(10, sizeof(bt_app_msg_t));   //创建消息队列：容量10条消息，每条消息大小= bt_app_msg_t
     xTaskCreate(bt_app_task_handler, "BtAppTask", 3072, NULL, 10, &s_bt_app_task_handle);
 }
@@ -308,6 +331,12 @@ void bt_app_task_shut_down(void)
 //I2S任务启动函数
 void bt_i2s_task_start_up(void)
 {
+    /* 幂等：若上一次的任务/环形缓冲区还在（例如断开重连、关蓝牙后再开），
+     * 先释放，避免任务与 32KB 环形缓冲区重复创建造成内存泄漏 */
+    if (s_bt_i2s_task_handle != NULL || s_ringbuf_i2s != NULL) {
+        bt_i2s_task_shut_down();
+    }
+
     ESP_LOGI(BT_APP_CORE_TAG, "环缓冲区数据为空! 等待数据: RINGBUFFER_MODE_PREFETCHING");
     // 初始化模式为预取模式（等待数据）
     ringbuffer_mode = RINGBUFFER_MODE_PREFETCHING;

@@ -51,7 +51,7 @@ extern "C" {
 #define AUDIO_REMOTE_RANGE_DB   (-24.0f)
 
 #define AUDIO_VOL_MAX           127     /* 音量满量程（与 AVRCP 0x7f 对齐） */
-#define AUDIO_VOL_DEFAULT       127     /* 开机默认：满 = 仅 TRIM 生效 */
+#define AUDIO_VOL_DEFAULT       100     /* 开机默认本机音量（串口屏音量条初始值，0-127） */
 
 /* 限幅器开关：
  *   0 = 仅固定 TRIM（默认，行为完全可预期，不引入动态特性）

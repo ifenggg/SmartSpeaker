@@ -46,4 +46,14 @@ extern uint8_t write_data_sleep_flag;
 void bt_i2s_driver_uninstall(void);
 extern uint8_t bt_con_flag;
 
+/**
+ * @brief 当前是否正在播放（音频流处于 STARTED）
+ */
+bool bt_a2d_is_playing(void);
+
+/**
+ * @brief 当前播放进度百分比（0-100），供串口屏切页后补发进度条数值
+ */
+uint8_t bt_a2d_get_progress(void);
+
 #endif /* __BT_APP_AV_H__*/

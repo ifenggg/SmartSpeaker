@@ -1,5 +1,21 @@
+/**
+ * @file led_strip.c
+ * @brief WS2812 灯带（RMT）驱动 + 开关/灯效状态机
+ *
+ * 【本次修复的 bug：串口屏"关灯"后再次开关灯无响应】
+ *   1) 旧 ledon 直接调 leds_init()：RMT 通道已经存在，同引脚二次创建必然失败，
+ *      ESP_ERROR_CHECK 触发断言 → 芯片复位重启（表现为"无响应"）；
+ *   2) 旧 leds_reon() 先 update_led() 再 rmt_enable()：向**已关闭**的 RMT 通道
+ *      发数据 → ESP_ERROR_CHECK 断言复位；
+ *   3) 旧 led_mode 任务用嵌套 while(1) 死循环跑彩虹，关灯（rmt_disable）之后
+ *      仍在每 50ms 调 update_led() → 复位。
+ *   现在：开关状态由 s_leds_on / s_leds_ready 统一守卫，所有底层调用先判状态，
+ *        且 ledon/ledoff 只走 leds_on()/leds_off()（调度级），不再碰初始化函数。
+ */
 #include "esp_check.h"
 #include <string.h>
+#include <stdlib.h>
+#include <math.h>       /* sinf：呼吸灯的正弦亮度包络 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -7,50 +23,68 @@
 #include "led_strip.h"
 #include <stdint.h>
 
-extern uint8_t ble_rec_buf[20];     //ble服务端接收到的数据包（颜色控制）
-QueueHandle_t led_queue = NULL;     //灯带队列句柄
-uint8_t leds_flag;                  //灯带初始化标志位
-extern char ui_res[10];
+static const char *LTAG = "led";
 
-static uint8_t ledmode;
+uint8_t led_strip_pixels[EXAMPLE_LED_NUMBERS * 3];
+
+/* ============================ 灯带状态 ============================ */
+static bool     s_leds_ready = false;               /* RMT 资源已创建 */
+static bool     s_leds_on    = false;               /* 逻辑开关：上电默认关，由串口屏开启 */
+static uint8_t  s_led_mode   = LED_MODE_STATIC;     /* 当前灯效 */
+/* 保存的颜色：上电默认 50,50,50（每次上电第一次开灯用这个）；
+ * 用户通过三色条改动、或关灯状态下发来 RGB，都会更新并保存（仅断电丢失） */
+static uint32_t s_rgb[3]     = {LED_DEFAULT_R, LED_DEFAULT_G, LED_DEFAULT_B};
+
+rmt_channel_handle_t led_chan = NULL;
+static rmt_encoder_handle_t led_encoder = NULL;
+static TaskHandle_t s_led_mode_task = NULL;
+
 static void led_mode(void *arg);
+static void led_strip_show(void);
 
-//led任务函数
-static void led_task(void* arg)
-{
-    uint32_t io_num;
-    for (;;) {          //永久循环
-        if (xQueueReceive(led_queue, &io_num, portMAX_DELAY)) {        //portMAX_DELAY：永久阻塞，直到队列中有数据（不会超时）
-            //update_led(ble_rec_buf[0],ble_rec_buf[1],ble_rec_buf[2]);
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-    }
-}
-
+/* =====================================================================
+ * 三色滚动条：串口屏发来的 "R<0-255>" / "G<0-255>" / "B<0-255>"
+ * ===================================================================== */
 void led_block(void)
 {
-    static uint32_t r=0,g=0,b=0;
-    vTaskDelay(pdMS_TO_TICKS(50));
-    if(leds_flag)
-    {
-        if(ui_res[0]=='R')
-            r = atoi(ui_res+1);
-        else if(ui_res[0]=='G')
-            g = atoi(ui_res+1);
-        else if(ui_res[0]=='B')
-            b = atoi(ui_res+1);
-        update_led(r,g,b);
-        //注意：颜色调节可能被串口屏连续拖动触发，用 LOGD 避免默认日志级别下刷屏
-        ESP_LOGD("leds","led颜色改为%lu,%lu,%lu",r,g,b);
+    if (!s_leds_ready || ui_res[0] == '\0') {
+        return;
     }
-        
+
+    char comp = ui_res[0];
+    int value = atoi(ui_res + 1);
+
+    uint8_t idx;
+    if (comp == 'R')      idx = 0;
+    else if (comp == 'G') idx = 1;
+    else if (comp == 'B') idx = 2;
+    else                  return;
+
+    leds_set_color(idx, (uint32_t)value);
+    /* 注意：颜色调节可能被串口屏连续拖动触发，用 LOGD 避免默认日志级别下刷屏 */
+    ESP_LOGD(LTAG, "颜色改为 R%lu G%lu B%lu", s_rgb[0], s_rgb[1], s_rgb[2]);
+}
+
+/* 设置单条通道（h0.val/h1.val/h2.val 与 R/G/B 前缀命令共用）：
+ * 拖动颜色条即视为"用户要静态颜色"（退出灯效，否则会被灯效下一帧覆盖）；
+ * 未开灯时只保存不点亮（保存值在下次开灯时使用）。 */
+void leds_set_color(uint8_t idx, uint32_t value)
+{
+    if (!s_leds_ready || idx > 2) {
+        return;
+    }
+    if (value > 255) {
+        value = 255;
+    }
+    s_led_mode = LED_MODE_STATIC;
+    s_rgb[idx] = value;
+
+    if (s_leds_on) {
+        update_led(s_rgb[0], s_rgb[1], s_rgb[2]);
+    }
 }
 
 /*RMT远程收发控制器*/
-
-const char *LTAG = "led";
-
-uint8_t led_strip_pixels[EXAMPLE_LED_NUMBERS * 3];
 
 //RMT 编码器
 typedef struct {
@@ -231,17 +265,40 @@ void led_strip_hsv2rgb(uint32_t h, uint32_t s, uint32_t v, uint32_t *r, uint32_t
     }
 }
 
-rmt_channel_handle_t led_chan = NULL;
-rmt_encoder_handle_t led_encoder = NULL;
+/* =====================================================================
+ * 底层：真正往灯带发一帧（不做开关判定，调用者必须已经确认通道已使能）
+ * ===================================================================== */
+static void led_strip_show(void)
+{
+    if (!s_leds_ready || led_chan == NULL || led_encoder == NULL) {
+        return;
+    }
+
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0, // 非循环传输
+    };
+
+    /* 这里刻意不用 ESP_ERROR_CHECK：灯带异常不该把整机拖去重启。
+     * 注意：本函数会被彩虹灯效以 50ms 周期调用，禁止打印日志刷屏。 */
+    esp_err_t err = rmt_transmit(led_chan, led_encoder, led_strip_pixels,
+                                 sizeof(led_strip_pixels), &tx_config);
+    if (err != ESP_OK) {
+        return;
+    }
+    rmt_tx_wait_all_done(led_chan, portMAX_DELAY);  //等待传输完成
+}
+
+/* =====================================================================
+ * 初始化 / 开 / 关 / 反初始化
+ * ===================================================================== */
 void leds_init(void)
 {
-    // //颜色分量
-    // uint32_t red = 0;
-    // uint32_t green = 0;
-    // uint32_t blue = 0;
-    // //色调
-    // uint16_t hue = 0;
-    // uint16_t start_rgb = 0;
+    /* 幂等保护：初始化只允许执行一次。
+     * 重复调用会二次创建同引脚 RMT 通道 → 失败 → 断言复位（旧 ledon 的 bug）。 */
+    if (s_leds_ready) {
+        ESP_LOGW(LTAG, "灯带已初始化，忽略重复的初始化调用");
+        return;
+    }
 
     //创建 RMT 发送通道
     rmt_tx_channel_config_t tx_chan_config = {
@@ -265,157 +322,241 @@ void leds_init(void)
     ESP_ERROR_CHECK(rmt_enable(led_chan));
     ESP_LOGI(LTAG, "已使能 RMT 发送通道");
 
-    led_queue = xQueueCreate(10, sizeof(uint32_t));    //创建gpio队列
-    //xTaskCreate(led_task, "led_task", 2048, NULL, 10, NULL);      //创建IO任务
-    //              入口函数        函数名称（终端可看）   栈深  参数 优先级 句柄
-    leds_flag = 1;
+    s_leds_ready = true;
+    s_leds_on = false;              /* 上电默认不点亮：等串口屏"灯带开关" */
+    s_led_mode = LED_MODE_STATIC;
+    /* 保存的颜色保持 LED_DEFAULT_R/G/B（50,50,50），首次开灯直接用它 */
 
-    xTaskCreate(led_mode, "led_mode", 1024 * 2, NULL, tskIDLE_PRIORITY + 1, NULL);
-    //          入口函数     函数名称      栈深      参数          优先级             句柄
+    /* 上电先发一帧全 0，清掉灯带上电随机状态，保证"上电是灭的" */
+    memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
+    led_strip_show();
 
-    update_led(50,50,50);
-    uart_send("h0.val=50");
-    uart_send("h1.val=50");
-    uart_send("h2.val=50");
+    if (s_led_mode_task == NULL) {
+        xTaskCreate(led_mode, "led_mode", 1024 * 2, NULL, tskIDLE_PRIORITY + 1, &s_led_mode_task);
+        //          入口函数     函数名称      栈深      参数          优先级             句柄
+    }
 
-    //彩虹灯追逐效果配置
-    // ESP_LOGI(LTAG, "Start LED rainbow chase");
-    // rmt_transmit_config_t tx_config = {
-    //     .loop_count = 0, // 非循环传输
-    // };
-    // while (1) {
-    //     for (int i = 0; i < 3; i++) {
-    //         for (int j = i; j < EXAMPLE_LED_NUMBERS; j += 3) {
-    //             // 计算当前灯珠的色调（hue）
-    //             hue = j * 360 / EXAMPLE_LED_NUMBERS + start_rgb;
-    //             //HSV 转 RGB（饱和度、亮度均为 100，确保颜色鲜艳）
-    //             led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
-    //             //将 RGB 数据存入数组（顺序：绿→蓝→红，匹配灯带协议）
-    //             led_strip_pixels[j * 3 + 0] = green;
-    //             led_strip_pixels[j * 3 + 1] = blue;
-    //             led_strip_pixels[j * 3 + 2] = red;
-    //         }
-    //         //发送 RGB 数据到 LED 灯带
-    //         ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-    //         ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY)); //等待传输完成
-    //         vTaskDelay(pdMS_TO_TICKS(EXAMPLE_CHASE_SPEED_MS));
-    //         //清空像素数组（熄灭 LED）
-    //         memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
-    //         // 再次发送空数据，让 LED 熄灭
-    //         ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-    //         ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-    //         vTaskDelay(pdMS_TO_TICKS(EXAMPLE_CHASE_SPEED_MS));
-    //     }
-    //     // 偏移色调（让下一轮彩虹“移动”60°）
-    //     start_rgb += 60;
-    // }
+    ESP_LOGI(LTAG, "灯带初始化完成（默认关闭，保存颜色 R%lu G%lu B%lu）",
+             s_rgb[0], s_rgb[1], s_rgb[2]);
 }
 
-uint32_t leds_last[3];
-void update_led(uint32_t red,uint32_t green,uint32_t blue)
+/* 开（调度级）：串口屏"灯带开关"打开走这里 */
+void leds_on(void)
 {
-    for (int i = 0; i < EXAMPLE_LED_NUMBERS; i++) 
-    {
-        //记录当前的颜色值
-        leds_last[0] = green;
-        leds_last[1] = blue;
-        leds_last[2] = red;
-        //将 RGB 数据存入数组（顺序：绿→蓝→红，匹配灯带协议）
-        led_strip_pixels[i * 3 + 0] = green;
-        led_strip_pixels[i * 3 + 1] = blue;
-        led_strip_pixels[i * 3 + 2] = red;
+    if (!s_leds_ready) {
+        ESP_LOGW(LTAG, "灯带尚未初始化，无法开启");
+        return;
     }
-    rmt_transmit_config_t tx_config = {
-        .loop_count = 0, // 非循环传输
-    };
-    //发送 RGB 数据到 LED 灯带
-    ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-    ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY)); //等待传输完成
-    //注意：本函数被彩虹流动效果以 50ms 周期调用，禁止在此打印日志，否则会刷屏并拖慢音频任务
+    if (!s_leds_on) {
+        /* 顺序必须是"先使能通道，再发数据"：旧 leds_reon() 顺序颠倒，向已关闭
+         * 的通道发送触发断言复位，这就是"关灯后再开灯无响应"的直接原因。 */
+        esp_err_t err = rmt_enable(led_chan);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(LTAG, "使能 RMT 通道失败: %s", esp_err_to_name(err));
+            return;
+        }
+        s_leds_on = true;
+    }
+
+    if (s_led_mode == LED_MODE_STATIC) {
+        update_led(s_rgb[0], s_rgb[1], s_rgb[2]);   /* 恢复上次颜色 */
+    }
+    ESP_LOGI(LTAG, "灯带已开启（灯效=%u, R%lu G%lu B%lu）",
+             s_led_mode, s_rgb[0], s_rgb[1], s_rgb[2]);
+}
+
+/* 关（调度级）：串口屏"灯带开关"关闭走这里 */
+void leds_off(void)
+{
+    if (!s_leds_ready) {
+        return;
+    }
+    if (!s_leds_on) {
+        ESP_LOGI(LTAG, "灯带本来就是关闭状态，忽略");
+        return;
+    }
+
+    update_led(0, 0, 0);        /* 关闭通道前先熄灭（此时通道还是使能的） */
+    s_leds_on = false;
+
+    esp_err_t err = rmt_disable(led_chan);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(LTAG, "关闭 RMT 通道失败: %s", esp_err_to_name(err));
+    }
+    ESP_LOGI(LTAG, "灯带已关闭");
+}
+
+/* 兼容旧命令名（ledreon） */
+void leds_reon(void)
+{
+    leds_on();
+}
+
+/* 反初始化：真正释放 RMT 资源。仅调试阶段或整机休眠使用，不挂"关灯"命令 */
+void leds_deinit(void)
+{
+    if (!s_leds_ready) {
+        return;
+    }
+
+    if (s_leds_on) {
+        update_led(0, 0, 0);
+        s_leds_on = false;
+        rmt_disable(led_chan);
+    }
+    if (led_encoder) {
+        rmt_del_encoder(led_encoder);
+        led_encoder = NULL;
+    }
+    if (led_chan) {
+        rmt_del_channel(led_chan);
+        led_chan = NULL;
+    }
+    s_leds_ready = false;
+    ESP_LOGI(LTAG, "灯带 RMT 资源已释放（反初始化完成）");
+}
+
+/* 直接刷新颜色：内部带"已初始化 + 已开灯"双重守卫，绝不会操作已关闭的通道 */
+void update_led(uint32_t red, uint32_t green, uint32_t blue)
+{
+    if (!s_leds_ready || !s_leds_on) {
+        return;
+    }
+    if (red > 255)   red = 255;
+    if (green > 255) green = 255;
+    if (blue > 255)  blue = 255;
+
+    for (int i = 0; i < EXAMPLE_LED_NUMBERS; i++)
+    {
+        //将 RGB 数据存入数组（顺序：绿→蓝→红，匹配灯带协议）
+        led_strip_pixels[i * 3 + 0] = (uint8_t)green;
+        led_strip_pixels[i * 3 + 1] = (uint8_t)blue;
+        led_strip_pixels[i * 3 + 2] = (uint8_t)red;
+    }
+    led_strip_show();
+}
+
+/* =====================================================================
+ * 灯效
+ * ===================================================================== */
+/* 灯效基准时刻：切换灯效时复位，让呼吸灯从"最暗"开始，而不是从任意相位切入 */
+static volatile uint32_t s_effect_base_ms = 0;
+
+void leds_set_mode(uint8_t mode)
+{
+    if (s_led_mode != mode) {
+        s_effect_base_ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
+    }
+    s_led_mode = mode;
+}
+
+/* 退出灯效：恢复保存的静态颜色（灯带保持亮） */
+void leds_set_static(void)
+{
+    leds_set_mode(LED_MODE_STATIC);
+    if (s_leds_on) {
+        update_led(s_rgb[0], s_rgb[1], s_rgb[2]);
+    }
 }
 
 void leds_mo1(void)
 {
-    ESP_LOGI("leds","流动彩虹");
-    ledmode = 1;
+    leds_set_mode(LED_MODE_RAINBOW);
+    ESP_LOGI(LTAG, "灯效1：流动彩虹（亮度 100%）");
 }
 
 void leds_mo2(void)
 {
-    ESP_LOGI("leds","模式2");
-    ledmode = 2;
+    leds_set_mode(LED_MODE_BREATH);
+    ESP_LOGI(LTAG, "灯效2：柔和呼吸灯（R→G→B 轮流，最大亮度 %d‰）", LED_BREATH_MAX * 100 / 255);
 }
 
+/**
+ * 灯效任务：单层循环 + 状态判断。
+ * 旧实现用嵌套 while(1) 跑彩虹且无法退出，关灯后仍向已关闭的 RMT 通道发数据，
+ * 会断言复位（这也是"关灯后再操作无响应"的根因之一）。
+ */
 static void led_mode(void *arg)
 {
-    //颜色分量
-    uint32_t red = 0;
-    uint32_t green = 0;
-    uint32_t blue = 0;
-    //色调
-    uint16_t hue = 0;
+    uint32_t red = 0, green = 0, blue = 0;
     uint16_t start_rgb = 0;
-    const int FLOW_SPEED_MS = 50;
-    // 色调变化的步长（数值越小，过渡越平滑）
-    const int HUE_STEP = 5;
+    const int FLOW_SPEED_MS = 50;   // 彩虹流动速度
+    const int HUE_STEP = 5;         // 色调步长（数值越小过渡越平滑）
 
-    while(1)
-    {
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        if(ledmode==1)
-        {
-            while (1) {
-                // 为每个LED设置颜色，形成连续的彩虹渐变
-                for (int j = 0; j < EXAMPLE_LED_NUMBERS; j++) {
-                    // 计算当前灯珠的色调（hue）
-                    // 加入全局偏移量start_rgb实现流动效果
-                    // 每个LED之间有固定的色调差，形成连续彩虹
-                    hue = (j * 360 / EXAMPLE_LED_NUMBERS + start_rgb) % 360;
-                    
-                    // HSV 转 RGB（饱和度、亮度均为100，确保颜色鲜艳）
-                    led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
-                    
-                    // 将 RGB 数据存入数组（顺序：绿→蓝→红，匹配灯带协议）
-                    led_strip_pixels[j * 3 + 0] = green;
-                    led_strip_pixels[j * 3 + 1] = blue;
-                    led_strip_pixels[j * 3 + 2] = red;
-                }
-                
-                // 发送 RGB 数据到 LED 灯带
-                update_led(green,blue,red);
-                
-                // 等待一段时间，控制流动速度
-                vTaskDelay(pdMS_TO_TICKS(FLOW_SPEED_MS));
-                
-                // 偏移色调（让彩虹整体向前流动）
-                start_rgb = (start_rgb + HUE_STEP) % 360;
-            }
+    while (1) {
+        /* 关灯 / 未初始化：什么都不做（既不刷新也不报错） */
+        if (!s_leds_ready || !s_leds_on) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
-        if(ledmode==2)
-        {
 
+        if (s_led_mode == LED_MODE_RAINBOW) {
+            for (int j = 0; j < EXAMPLE_LED_NUMBERS; j++) {
+                // 计算当前灯珠的色调（hue）；加入全局偏移量 start_rgb 实现流动效果
+                uint16_t hue = (j * 360 / EXAMPLE_LED_NUMBERS + start_rgb) % 360;
+                // HSV 转 RGB（饱和度、亮度均为100，确保颜色鲜艳）
+                led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
+                // 将 RGB 数据存入数组（顺序：绿→蓝→红，匹配灯带协议）
+                led_strip_pixels[j * 3 + 0] = (uint8_t)green;
+                led_strip_pixels[j * 3 + 1] = (uint8_t)blue;
+                led_strip_pixels[j * 3 + 2] = (uint8_t)red;
+            }
+            led_strip_show();
+
+            start_rgb = (start_rgb + HUE_STEP) % 360;   // 偏移色调（让彩虹整体向前流动）
+            vTaskDelay(pdMS_TO_TICKS(FLOW_SPEED_MS));
+        }
+        else if (s_led_mode == LED_MODE_BREATH) {
+            /* 柔和呼吸灯：R→G→B 依次，每个颜色做一次"渐亮 + 渐暗"。
+             * 亮度 = 正弦包络（0 → LED_BREATH_MAX → 0），峰值刻意低于彩虹的 100%，
+             * 避免夜间刺眼；正弦包络比三角波更柔和、无折点。 */
+            uint32_t now = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
+            uint32_t el   = now - s_effect_base_ms;                 /* 灯效已运行毫秒数 */
+            uint32_t step = el / LED_BREATH_PERIOD_MS;              /* 第几次呼吸 */
+            uint32_t phase = el % LED_BREATH_PERIOD_MS;             /* 本次呼吸内相位 */
+
+            /* sin(0)=0 → 最暗，sin(π/2)=1 → 最亮，sin(π)=0 → 最暗 */
+            float env = sinf(3.14159265f * (float)phase / (float)LED_BREATH_PERIOD_MS);
+            uint32_t level = (uint32_t)((float)LED_BREATH_MAX * env + 0.5f);
+
+            red = green = blue = 0;
+            switch (step % 3) {                                      /* 三色轮流 */
+            case 0:  red = level;   break;
+            case 1:  green = level; break;
+            default: blue = level;  break;
+            }
+
+            for (int j = 0; j < EXAMPLE_LED_NUMBERS; j++) {
+                led_strip_pixels[j * 3 + 0] = (uint8_t)green;
+                led_strip_pixels[j * 3 + 1] = (uint8_t)blue;
+                led_strip_pixels[j * 3 + 2] = (uint8_t)red;
+            }
+            led_strip_show();
+            vTaskDelay(pdMS_TO_TICKS(LED_BREATH_STEP_MS));
+        }
+        else {
+            /* 静态颜色：无需本任务刷新（改颜色时由 leds_set_color() 直接刷新） */
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-
-    
 }
 
-
-void leds_deinit(void)
+/* =====================================================================
+ * 状态查询（供串口屏切页后刷新按钮/滚动条状态）
+ * ===================================================================== */
+bool leds_is_on(void)
 {
-    update_led(0,0,0);
-    ESP_LOGI("leds","已关灯");
-    leds_flag=0;
-    ESP_ERROR_CHECK(rmt_disable(led_chan));
-    ESP_LOGI(LTAG, "已关闭 RMT 发送通道");
+    return s_leds_on;
 }
-void leds_reon(void)
+
+uint8_t leds_get_mode(void)
 {
-    uart_send("h0.val=%lu",leds_last[0]);
-    uart_send("h1.val=%lu",leds_last[1]);
-    uart_send("h2.val=%lu",leds_last[2]);
-    update_led(leds_last[2],leds_last[0],leds_last[1]);
-    leds_flag=1;
-    ESP_ERROR_CHECK(rmt_enable(led_chan));
-    ESP_LOGI("leds","已重启led配置");
+    return s_led_mode;
+}
+
+void leds_get_rgb(uint32_t *r, uint32_t *g, uint32_t *b)
+{
+    if (r) *r = s_rgb[0];
+    if (g) *g = s_rgb[1];
+    if (b) *b = s_rgb[2];
 }

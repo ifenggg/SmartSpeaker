@@ -79,9 +79,13 @@ void bt_i2s_task_shut_down(void);
 size_t write_ringbuf(const uint8_t *data, size_t size);
 
 extern uint8_t write_data_sleep_flag;
-void bt_page(void);
+/* 播放/暂停（调度级开关，不是初始化/反初始化） */
 void bt_sleep(void);
 void bt_work(void);
+/* 关蓝牙时把被挂起的任务恢复回可调度状态（供 bt_app_shutdown 复用） */
+void bt_tasks_resume(void);
+/* 当前是否处于"暂停挂起"状态 */
+bool bt_is_paused(void);
 void bt_vo(void);
 void bt_ne(void);
 void bt_la(void);
