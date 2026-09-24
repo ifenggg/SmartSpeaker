@@ -16,6 +16,7 @@
 #include "led_strip.h"
 #include "uart.h"
 #include "ui.h"          // 串口屏交互层（页面状态机 + 命令分发 + 切页状态补发）
+#include "health.h"      // 手表健康数据（解析 + NVS 保存 + health 页刷新 + 睡眠联动）
 #include "sd.h"
 #include <adc.h>
 
@@ -123,6 +124,7 @@ void app_main(void)
 
     /* ---------- 4. BLE 主机：连接手表（health 页数据来源） ---------- */
     ble_client_init();  //BLE GATT Client（主机）：扫描并连接手表 OV_WATCH（服务 0xFFF0 / 特征 0xFFF1）
+    health_init();      //健康数据：NVS 载入上次数值 + 注册手表数据回调 + 睡眠标志联动
 
     /* ---------- 5. 灯带：只初始化不点亮 ----------
      * leds_init() 只创建 RMT 资源并把灯带清成"灭"；

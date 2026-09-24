@@ -64,6 +64,7 @@ static volatile uint32_t s_gain_q15   = 32768u;        /* Q15 线性增益，327
 static volatile float    s_gain_db    = 0.0f;          /* 当前总衰减(dB)，仅用于显示 */
 static volatile uint8_t  s_vol        = AUDIO_VOL_MAX; /* 本机音量 0..127 */
 static volatile uint8_t  s_vol_remote = 0x7f;          /* 手机绝对音量 0..0x7f */
+static volatile uint16_t s_dim_permille = AUDIO_DIM_FULL_PERMILLE;  /* 减弱系数（手表睡眠联动） */
 
 /* =====================================================================
  * 内部函数
@@ -113,6 +114,17 @@ static void audio_update_gain_locked(void)
     }
     db += AUDIO_REMOTE_RANGE_DB * (1.0f - (float)s_vol_remote / 127.0f);
 #endif
+
+    /* 睡眠减弱系数：在上面三层之外再乘一个线性系数（1000‰ = 不减弱）。
+     * 0 视为数字静音；其余按 dB 折算，与既有 TRIM 一起走同一条增益计算路径。 */
+    if (s_dim_permille < AUDIO_DIM_FULL_PERMILLE) {
+        if (s_dim_permille == 0) {
+            s_gain_db = -96.0f;
+            s_gain_q15 = 0u;
+            return;
+        }
+        db += 20.0f * log10f((float)s_dim_permille / (float)AUDIO_DIM_FULL_PERMILLE);
+    }
 
     s_gain_db  = db;
     s_gain_q15 = audio_db_to_q15(db);
@@ -184,6 +196,25 @@ uint32_t audio_vol_get_gain_q15(void)
 float audio_vol_get_db(void)
 {
     return s_gain_db;
+}
+
+void audio_vol_set_dim_permille(uint16_t permille)
+{
+    if (permille > AUDIO_DIM_FULL_PERMILLE) {
+        permille = AUDIO_DIM_FULL_PERMILLE;
+    }
+
+    _lock_acquire(&s_lock);
+    s_dim_permille = permille;
+    audio_update_gain_locked();
+    _lock_release(&s_lock);
+
+    ESP_LOGD(TAG, "减弱系数 -> %u‰ (总衰减 %.1fdB)", (unsigned)permille, (double)s_gain_db);
+}
+
+uint16_t audio_vol_get_dim_permille(void)
+{
+    return s_dim_permille;
 }
 
 void audio_apply_gain_i16(int16_t *pcm, size_t samples)

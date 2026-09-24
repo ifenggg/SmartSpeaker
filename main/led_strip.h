@@ -41,6 +41,9 @@
 #define LED_DEFAULT_G               50
 #define LED_DEFAULT_B               50
 
+/* 亮度系数满量程（千分比）：1000 = 不减弱。睡眠模式（手表 SLEEP=1）用 */
+#define LED_DIM_FULL_PERMILLE       1000
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -95,6 +98,19 @@ void leds_set_static(void);
 bool leds_is_on(void);                                  /* 灯带开关状态（供串口屏刷新开关控件 n0） */
 uint8_t leds_get_mode(void);                            /* 当前灯效编号 */
 void leds_get_rgb(uint32_t *r, uint32_t *g, uint32_t *b);   /* 当前保存的颜色（供串口屏刷新三色条 h0/h1/h2） */
+
+/**
+ * @brief 设置亮度系数（千分比，1000 = 不减弱）
+ * @param permille 0~1000；睡眠联动用（SLEEP=1 时逐级降到 100 = 10%）
+ * @note  系数在"发送灯珠数据前"乘到像素上，**不改变保存的 RGB**，
+ *        所以串口屏三色条显示的仍是用户设定的颜色；灯效也一并变暗。
+ */
+void leds_set_dim_permille(uint16_t permille);
+
+/**
+ * @brief 读取当前亮度系数（千分比）
+ */
+uint16_t leds_get_dim_permille(void);
 
 #ifdef __cplusplus
 }

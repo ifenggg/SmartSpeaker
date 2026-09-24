@@ -53,6 +53,9 @@ extern "C" {
 #define AUDIO_VOL_MAX           127     /* 音量满量程（与 AVRCP 0x7f 对齐） */
 #define AUDIO_VOL_DEFAULT       100     /* 开机默认本机音量（串口屏音量条初始值，0-127） */
 
+/* 减弱系数满量程（千分比）：1000 = 不减弱。睡眠模式（手表 SLEEP=1）用 */
+#define AUDIO_DIM_FULL_PERMILLE 1000
+
 /* 限幅器开关：
  *   0 = 仅固定 TRIM（默认，行为完全可预期，不引入动态特性）
  *   1 = 追加分块包络限幅，把平均响度顶到上限（可能有轻微"抽气感"）
@@ -127,6 +130,21 @@ float audio_vol_get_db(void);
  *       增益为 0dB 时直接返回，零额外开销；增益为 0 时整块写零。
  */
 void audio_apply_gain_i16(int16_t *pcm, size_t samples);
+
+/**
+ * @brief 设置"减弱系数"（千分比，1000 = 不减弱）
+ *
+ * @param permille 0~1000；用于手表睡眠标志联动（SLEEP=1 时逐级降到 100 = 10%）
+ *
+ * @note 该系数乘在 TRIM / 本机音量 / 手机音量之外，**不改变用户设置的音量值**，
+ *       因此串口屏音量条显示的仍是用户值；0 视为数字静音。
+ */
+void audio_vol_set_dim_permille(uint16_t permille);
+
+/**
+ * @brief 读取当前减弱系数（千分比）
+ */
+uint16_t audio_vol_get_dim_permille(void);
 
 #ifdef __cplusplus
 }

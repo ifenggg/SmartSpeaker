@@ -15,6 +15,7 @@ idf_component_register(SRCS "amp.c"
                             "sd.c"
                             "uart.c"
                             "ui.c"
+                            "health.c"      # 手表健康数据（解析/NVS/health 页刷新/睡眠联动）
                             "led_strip.c"
                             "bt_app_av.c"
                             "bt_app_core.c"

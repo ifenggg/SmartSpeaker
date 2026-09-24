@@ -398,6 +398,19 @@ static bool ble_c_scan_match(esp_ble_gap_cb_param_t *scan, char *name_out, size_
  * 扫描 / 连接 / 重连控制
  * --------------------------------------------------------------------- */
 
+/**
+ * 当前是否处于"正在建链 / 已连接"阶段。
+ * 用途：过滤**上一轮遗留的异步事件** —— 栈在放弃一次建链后会延迟上报
+ * DISCONNECT(rsn=0x100 CONN_CANCEL) / OPEN 失败(0x85)，如果此时我们已经进入
+ * 新一轮扫描，这些陈旧事件会被误当成当前流程的事件，把状态机打乱
+ * （表现为：状态被重置为 IDLE、误换参档，随后 BTM_BleScan scan already active、扫描启动失败）。
+ */
+static bool ble_c_link_active(void)
+{
+    ble_c_state_t st = ble_c_state_get();
+    return (st == BLE_C_STATE_CONNECTING) || (st == BLE_C_STATE_CONNECTED);
+}
+
 /* 开始扫描（0 = 持续扫描，由 s_scan_timer 负责超时） */
 static void ble_c_start_scan(void)
 {
@@ -413,11 +426,13 @@ static void ble_c_start_scan(void)
     }
     ble_c_set_state(BLE_C_STATE_SCANNING);
     s_pending_open = false;
-    if (esp_ble_gap_start_scanning(0) != ESP_OK) {
-        ESP_LOGE(TAG, "启动扫描失败");
-        ble_c_set_state(BLE_C_STATE_IDLE);
-        ble_c_schedule_reconnect();
-        return;
+
+    /* 启动失败（最常见是上一轮扫描没停干净：BTM_BleScan scan already active）时不要直接放弃：
+     * 保持 SCANNING 状态并启动超时计时，仍可能收到扫描结果；到点由 scan_timer_cb
+     * 统一 stop + 重连，状态自然收敛。 */
+    esp_err_t serr = esp_ble_gap_start_scanning(0);
+    if (serr != ESP_OK) {
+        ESP_LOGW(TAG, "启动扫描返回 0x%x（多为上一轮扫描未停干净），继续等待扫描结果", serr);
     }
     xTimerStart(s_scan_timer, 0);
 }
@@ -682,6 +697,21 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                  param->scan_rst.adv_data_len, param->scan_rst.scan_rsp_len,
                  param->scan_rst.ble_evt_type);
 
+        /* 信号太弱时明确提示：建链需要"对端在连接锚点回包"，RSSI 太低必然失败(0x3e)。
+         * 经验阈值：-63~-74 可稳定建链；-89~-96 建链失败。
+         * 另注：手表的名称只在**扫描响应**里，rsp=0 说明我们发的 SCAN_REQ 都没被应答，
+         *       同样预示建链会失败 —— 请先靠近设备再试。 */
+        if (param->scan_rst.rssi < BLE_CLIENT_RSSI_WARN_DBM) {
+            ESP_LOGW(TAG, "信号很弱（RSSI=%d dBm < %d dBm）：建链大概率失败(0x3e)，"
+                          "请把手表靠近音箱（建议 10cm 内）后重试",
+                     param->scan_rst.rssi, BLE_CLIENT_RSSI_WARN_DBM);
+        }
+        if (param->scan_rst.adv_data_len + param->scan_rst.scan_rsp_len == 7 &&
+            param->scan_rst.scan_rsp_len == 0) {
+            ESP_LOGW(TAG, "未收到扫描响应（名字只在扫描响应里，故名称解析为空）：链路质量差，"
+                          "对端可能也收不到 CONNECT_IND");
+        }
+
         esp_ble_gap_stop_scanning();
         break;
     }
@@ -735,6 +765,13 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 
     case ESP_GATTC_OPEN_EVT: {
         if (param->open.status != ESP_GATT_OK) {
+            /* 过滤上一轮遗留的 OPEN 失败：此时我们可能已经进入新一轮扫描，
+             * 不能被它触发清理/换档（否则会打乱状态机）。 */
+            if (!ble_c_link_active()) {
+                ESP_LOGW(TAG, "忽略上一轮遗留的 OPEN 失败: 0x%x（当前状态=%d，可能已在新一轮扫描中）",
+                         param->open.status, (int)ble_c_state_get());
+                break;
+            }
             ESP_LOGE(TAG, "GATT 打开失败: 0x%x（0x85=ESP_GATT_ERROR；链路未建立请看断开事件的 reason=0x3e）",
                      param->open.status);
             ble_c_fail_and_reconnect(NULL);
@@ -875,10 +912,18 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
         break;
 
     case ESP_GATTC_DISCONNECT_EVT: {
-        if (ble_c_state_get() == BLE_C_STATE_IDLE && s_conn_id == 0) {
-            break;              /* 已由 OPEN 失败路径清理过，避免重复上报 */
+        /* 只处理"本轮建链/已连接"期间的断开事件。
+         * 栈在放弃一次建链后会延迟上报 DISCONNECT(rsn=0x100 CONN_CANCEL)，
+         * 若此时我们已进入新一轮扫描，处理它会把状态机重置为 IDLE，导致：
+         *   · 扫描器其实还在跑，但状态机以为没在扫 → "BTM_BleScan scan already active / 扫描启动失败"；
+         *   · 误当作失败去换连接参档。 */
+        if (!ble_c_link_active()) {
+            ESP_LOGW(TAG, "忽略上一轮遗留的断开事件: reason=0x%02x（当前状态=%d，可能已在新一轮扫描中）",
+                     param->disconnect.reason, (int)ble_c_state_get());
+            break;
         }
-        ESP_LOGW(TAG, "连接断开, reason=0x%02x（0x3e=链路未建立，0x08=超时，0x13=对端主动断开，0x16=本机断开）",
+        ESP_LOGW(TAG, "连接断开, reason=0x%02x（0x3e=链路未建立，0x08=超时，0x13=对端主动断开，"
+                      "0x16=本机断开，0x100=本机取消建链）",
                  param->disconnect.reason);
         ble_c_reset_link();
         if (s_auto_reconnect) {

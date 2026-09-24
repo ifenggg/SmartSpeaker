@@ -35,6 +35,11 @@ static uint8_t  s_led_mode   = LED_MODE_STATIC;     /* 当前灯效 */
  * 用户通过三色条改动、或关灯状态下发来 RGB，都会更新并保存（仅断电丢失） */
 static uint32_t s_rgb[3]     = {LED_DEFAULT_R, LED_DEFAULT_G, LED_DEFAULT_B};
 
+/* 亮度系数（千分比）：睡眠联动用。只作用于"发出去的像素"，
+ * led_strip_pixels 始终保存原始值，所以保存的 RGB / 屏幕三色条不受影响 */
+static uint16_t s_dim_permille = LED_DIM_FULL_PERMILLE;
+static uint8_t  led_strip_tx[EXAMPLE_LED_NUMBERS * 3];
+
 rmt_channel_handle_t led_chan = NULL;
 static rmt_encoder_handle_t led_encoder = NULL;
 static TaskHandle_t s_led_mode_task = NULL;
@@ -274,18 +279,50 @@ static void led_strip_show(void)
         return;
     }
 
+    /* 亮度系数：把"原始像素"缩放后发送（led_strip_pixels 保持不变，
+     * 因此保存的 RGB 与屏幕三色条不受睡眠减弱影响） */
+    if (s_dim_permille != LED_DIM_FULL_PERMILLE) {
+        for (size_t i = 0; i < sizeof(led_strip_pixels); i++) {
+            led_strip_tx[i] = (uint8_t)(((uint32_t)led_strip_pixels[i] * s_dim_permille)
+                                        / LED_DIM_FULL_PERMILLE);
+        }
+    } else {
+        memcpy(led_strip_tx, led_strip_pixels, sizeof(led_strip_tx));
+    }
+
     rmt_transmit_config_t tx_config = {
         .loop_count = 0, // 非循环传输
     };
 
     /* 这里刻意不用 ESP_ERROR_CHECK：灯带异常不该把整机拖去重启。
      * 注意：本函数会被彩虹灯效以 50ms 周期调用，禁止打印日志刷屏。 */
-    esp_err_t err = rmt_transmit(led_chan, led_encoder, led_strip_pixels,
-                                 sizeof(led_strip_pixels), &tx_config);
+    esp_err_t err = rmt_transmit(led_chan, led_encoder, led_strip_tx,
+                                 sizeof(led_strip_tx), &tx_config);
     if (err != ESP_OK) {
         return;
     }
     rmt_tx_wait_all_done(led_chan, portMAX_DELAY);  //等待传输完成
+}
+
+/* 亮度系数（千分比）：变化时立刻重发一帧，让"静态颜色"也能跟着变暗/变亮 */
+void leds_set_dim_permille(uint16_t permille)
+{
+    if (permille > LED_DIM_FULL_PERMILLE) {
+        permille = LED_DIM_FULL_PERMILLE;
+    }
+    if (permille == s_dim_permille) {
+        return;
+    }
+    s_dim_permille = permille;
+
+    if (s_leds_ready && s_leds_on) {
+        led_strip_show();
+    }
+}
+
+uint16_t leds_get_dim_permille(void)
+{
+    return s_dim_permille;
 }
 
 /* =====================================================================

@@ -23,6 +23,7 @@
 #include "sys/lock.h"
 
 #include "ui.h"     /* 串口屏界面状态：当前页判断 + 状态推送 */
+#include "health.h" /* 健康数据：A2DP 重连时解除手表睡眠(SLEEP=2)锁定 */
 
 //AVRCP（音视频远程控制协议）使用的事务标签
 #define APP_RC_CT_TL_GET_CAPS            (0)    //标识 AVRCP 控制器发起的 “获取对方设备能力” 操作
@@ -358,6 +359,8 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             vTaskResume(s_bt_i2s_task_handle);
             write_data_sleep_flag = 1;
             bt_con_flag = 1;
+            /* A2DP 重连 → 解除手表睡眠(SLEEP=2)锁定，恢复功放与灯带 */
+            health_on_a2dp_connected();
             if(ui_get_page() == UI_PAGE_BT)
                 ui_push_bt_conn_state();
         } 

@@ -39,6 +39,7 @@
 #include "bt_app_core.h"
 #include "bt_app_av.h"
 #include "audio_vol.h"
+#include "health.h"     /* 健康数据：health 页刷新、$GET,DATA 请求 / $END 停止、睡眠锁定解锁 */
 #include "sd.h"
 
 #include "freertos/FreeRTOS.h"
@@ -456,6 +457,12 @@ static void ui_enter_page(ui_page_t page)
  */
 static void ui_on_page_exit(void)
 {
+    /* 离开 health 页要通知手表停止传感器上报（exit 是切页与休眠退出都会发的），
+     * 注意：此时 s_page 仍是"正在离开的那一页" */
+    if (s_page == UI_PAGE_HEALTH) {
+        health_stop_stream();
+    }
+
     s_exit_pending = true;
     s_exit_tick = xTaskGetTickCount();
     ESP_LOGI(TAG, "屏幕发来 exit（离开当前页）→ 等待新页面名，%d ms 内没有则判定休眠",
@@ -483,6 +490,12 @@ static void ui_enter_sleep(void)
     if (s_page == UI_PAGE_SLEEP) {
         return;                         /* 已在休眠态，避免重复打印 */
     }
+
+    /* 屏幕自动休眠（0x86）可能没有 exit，这里兜底：仍在 health 页就先停掉手表上报 */
+    if (s_page == UI_PAGE_HEALTH) {
+        health_stop_stream();
+    }
+
     s_exit_pending = false;
     s_page = UI_PAGE_SLEEP;             /* s_page_awake 保留：唤醒时恢复用 */
     ESP_LOGW(TAG, "判定串口屏已休眠（暂停向屏幕推送页面状态）");
@@ -507,6 +520,11 @@ static void ui_wake_from_sleep(void)
     uart_send("sendme");
     /* 兜底：先把电量刷一次（若屏幕上报页面名/页面ID，还会再完整补发一次该页状态） */
     ui_push_battery();
+
+    /* 唤醒后仍在 health 页：重新请求一次传感器数据（休眠时已发过 $END） */
+    if (s_page == UI_PAGE_HEALTH) {
+        health_request_from_watch();
+    }
 }
 
 /* 屏幕自动上报的状态（0x86 休眠 / 0x87 唤醒 / 0x88 启动完成） */
@@ -579,9 +597,16 @@ void ui_refresh_page(ui_page_t page)
 
     case UI_PAGE_MAIN:
     case UI_PAGE_SET:
-    case UI_PAGE_HEALTH:    /* health/sd 暂时只刷新电量，传感器数据与交互待后续开发 */
-    case UI_PAGE_SD:
+    case UI_PAGE_SD:        /* sd 暂时只刷新电量，SD 功能待后续开发 */
         ui_push_battery();
+        break;
+
+    case UI_PAGE_HEALTH:
+        /* health 页：电量 + 已存健康数据（t0~t3）；
+         * 随后向手表请求一次最新传感器数据，回包到达后由 health 模块再刷一次 */
+        ui_push_battery();
+        health_ui_push();
+        health_request_from_watch();
         break;
 
     case UI_PAGE_LEDS:
@@ -871,6 +896,7 @@ static void cmd_bt_off(void)
 static void cmd_bt_play(void)
 {
     bt_work();                  /* AVRCP 播放 + 开功放（与手机同步） */
+    health_on_user_play();      /* 用户主动播放 → 解除手表睡眠(SLEEP=2)锁定 */
 }
 
 static void cmd_bt_pause(void)
