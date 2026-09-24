@@ -57,6 +57,13 @@ extern "C" {
  * 10 字节的旧缓冲会把 "b0.val=100" 这类陶晶驰属性回传截断，故放大到 32。 */
 #define UI_CMD_MAX          32
 
+/* 串口屏 UART2 引脚定义（uart.c 与整机休眠的唤醒源共用同一份定义，只改这里）：
+ *   TX = ESP32 → 屏幕 RX
+ *   RX = ESP32 ← 屏幕 TX：空闲为高、起始位为下降沿，
+ *        整机 light sleep 时正是靠这个低电平唤醒（见 power.h/power.c） */
+#define UART_SCREEN_TXD_GPIO   GPIO_NUM_17
+#define UART_SCREEN_RXD_GPIO   GPIO_NUM_16
+
 /* 无帧尾（prints 风格）时的断帧空闲阈值（ms）：
  * 连续 UI_RX_IDLE_MS 没有新字节，才把已累计的可打印内容当成一条完整命令。 */
 #define UI_RX_IDLE_MS       30
@@ -92,6 +99,14 @@ void uart_send_text(const char *obj_txt_attr, const char *text);
  * @return true=取到，false=超时
  */
 bool uart_recv_ui_cmd(char *out, uint32_t out_sz, uint32_t wait_ms);
+
+/**
+ * @brief 丢弃残帧：清空驱动接收缓冲，并让 rx_task 把"正在累积的半帧"也丢掉
+ * @note  整机从 light sleep 醒来后调用。light sleep 期间 UART 被 IDF 停掉，
+ *        唤醒瞬间到达的字节必然丢/截断，先清干净再解析，避免把半截命令当有效指令。
+ *        可在任意任务上下文调用（不能中断上下文）。
+ */
+void uart_rx_discard_pending(void);
 
 /* TJC 二进制返回码回调（由 ui.c 注册，uart.c 只负责解析与转发） */
 typedef void (*uart_tjc_key_cb_t)(uint8_t page_id, uint8_t comp_id, uint8_t event);

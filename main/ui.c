@@ -41,6 +41,7 @@
 #include "audio_vol.h"
 #include "health.h"     /* 健康数据：health 页刷新、$GET,DATA 请求 / $END 停止、睡眠锁定解锁 */
 #include "sd.h"
+#include "power.h"      /* 整机休眠：有效指令计活动 + 唤醒后等外设恢复完成 */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -50,6 +51,17 @@
 #include <stdlib.h>
 
 static const char *TAG = "UI";
+
+/* 一条"有效指令"开始执行的统一入口：
+ *   ① 记一次活动（整机休眠倒计时的"串口屏有效指令"一路；**未识别的命令不算**）；
+ *   ② 若刚从整机休眠中醒来（外设还在恢复），先等恢复完成再执行本条命令 ——
+ *      否则 bton/btpla 会作用在还没使能的蓝牙协议栈上（bt_a2dp_work() 里的
+ *      assert(esp_avrc_ct_init() == ESP_OK) 会直接把芯片复位）。
+ * 只在"确认识别成功"的分支里调用，未知命令/粘连拆分失败/错误帧都不走这里。 */
+#define UI_VALID_CMD()   do {                               \
+        power_note_activity(POWER_SRC_SCREEN);              \
+        power_wait_ready(POWER_WAIT_READY_MS);              \
+    } while (0)
 
 /* ============================ 模块状态 ============================ */
 static ui_page_t s_page = UI_PAGE_UNKNOWN;      /* 屏幕当前页面；UI_PAGE_SLEEP = 已休眠 */
@@ -230,6 +242,7 @@ static bool ui_handle_token(const char *tok)
     /* a) 页面名：屏幕每次切页都会发回页面名 → 记录页面并补发该页状态 */
     for (size_t i = 0; i < ARRAY_SIZE(s_page_names); i++) {
         if (strcmp(ui_res, s_page_names[i].name) == 0) {
+            UI_VALID_CMD();
             ui_enter_page(s_page_names[i].page);
             return true;
         }
@@ -237,12 +250,14 @@ static bool ui_handle_token(const char *tok)
 
     /* b) exit：屏幕"页面离开事件"——正常切页时随后就到页面名，否则判定休眠 */
     if (ui_is_exit_cmd(ui_res)) {
+        UI_VALID_CMD();
         ui_on_page_exit();
         return true;
     }
 
     /* c) 陶晶驰属性回传形式（"控件.属性=数值"），按当前页面判定含义 */
     if (ui_attr_int(ui_res, "n0.val", &val)) {
+        UI_VALID_CMD();
         /* leds 页与 bt 页的开关控件同名 n0，只能用当前页面区分。
          * 屏幕侧开关已是二值：1=开，0=关。 */
         if (s_page == UI_PAGE_LEDS) {
@@ -259,12 +274,14 @@ static bool ui_handle_token(const char *tok)
         return true;
     }
     if (ui_attr_int(ui_res, "n2.val", &val)) {
+        UI_VALID_CMD();
         /* 音量开关：1=开=静音，0=关=开启声音 */
         if (val == TJC_SW_ON)        cmd_bt_mute();
         else if (ui_sw_is_off(val))  cmd_bt_unmute();
         return true;
     }
     if (ui_attr_int(ui_res, "h0.val", &val)) {
+        UI_VALID_CMD();
         if (s_page == UI_PAGE_BT) {
             cmd_bt_set_volume(val);                     /* bt  页 h0 = 音量条 0-127 */
         } else if (s_page == UI_PAGE_LEDS) {
@@ -277,12 +294,14 @@ static bool ui_handle_token(const char *tok)
         return true;
     }
     if (ui_attr_int(ui_res, "h1.val", &val)) {
+        UI_VALID_CMD();
         if (s_page == UI_PAGE_LEDS) {
             leds_set_color(1, (uint32_t)val);           /* leds 页 h1 = G 0-255 */
         }
         return true;
     }
     if (ui_attr_int(ui_res, "h2.val", &val)) {
+        UI_VALID_CMD();
         if (s_page == UI_PAGE_LEDS) {
             leds_set_color(2, (uint32_t)val);           /* leds 页 h2 = B 0-255 */
         }
@@ -291,10 +310,12 @@ static bool ui_handle_token(const char *tok)
 
     /* d) 旧命令串：带参数的前缀型命令 */
     if (ui_res[0] == 'R' || ui_res[0] == 'G' || ui_res[0] == 'B') {
+        UI_VALID_CMD();
         led_block();        // 三色滚动条："R255" / "G128" / "B064"
         return true;
     }
     if (ui_res[0] == 'V') {
+        UI_VALID_CMD();
         bt_vo();            // 音量条：旧串 "V0" ~ "V127"
         ui_sync_mute_switch();
         return true;
@@ -305,6 +326,7 @@ static bool ui_handle_token(const char *tok)
     for (size_t i = 0; i < ARRAY_SIZE(commandMap); i++) {
         if (len == commandMap[i].cmd_len && strcmp(ui_res, commandMap[i].command) == 0) {
             ESP_LOGD(TAG, "执行命令: %s", ui_res);
+            UI_VALID_CMD();
             commandMap[i].handler();
             return true;
         }
@@ -527,6 +549,29 @@ static void ui_wake_from_sleep(void)
     }
 }
 
+/**
+ * 整机从 light sleep 醒来、外设恢复完成后调用（power.c）。
+ *
+ * 与"屏幕被触摸唤醒"（ui_wake_from_sleep）不同：这里是**主控**醒过一轮，
+ * 期间屏幕可能自己休眠过/切过页/重启过，所以必须重新问一次页面并补发状态，
+ * 否则屏幕上的开关/音量可能和音箱内部状态不一致。
+ */
+void ui_on_mcu_wake(void)
+{
+    if (s_page == UI_PAGE_SLEEP) {
+        /* 屏幕自己也在休眠：此时不推送（睡了就不该打扰它），等它被触摸唤醒后
+         * 走正常的 ui_wake_from_sleep() 补发。 */
+        ESP_LOGI(TAG, "整机唤醒：屏幕仍处于休眠态 → 暂不推送，等屏幕被触摸唤醒");
+        return;
+    }
+
+    ESP_LOGI(TAG, "整机唤醒：向屏幕重新同步（sendme + 电量 + 当前页 [%s] 状态）",
+             ui_page_name(s_page));
+    uart_send("sendme");
+    ui_push_battery();
+    ui_refresh_page(s_page);
+}
+
 /* 屏幕自动上报的状态（0x86 休眠 / 0x87 唤醒 / 0x88 启动完成） */
 static void ui_on_tjc_event(uint8_t code)
 {
@@ -537,6 +582,9 @@ static void ui_on_tjc_event(uint8_t code)
         ui_enter_sleep();
         break;
     case 0x87:
+        /* 屏幕自动唤醒 = 有人碰了屏幕 → 算用户活动（随后通常还会来页面名/控件命令）。
+         * 本回调跑在 rx_task 里，这里只记活动，恢复动作交给 power 看护任务。 */
+        power_note_activity(POWER_SRC_SCREEN);
         ui_wake_from_sleep();
         break;
     case 0x88:
@@ -940,9 +988,11 @@ static void ui_on_tjc_key(uint8_t page_id, uint8_t comp_id, uint8_t event)
 {
     /* 屏幕勾选"发送键值"后，控件按下/弹起会返回 0x65 <页ID> <控件ID> <事件>。
      * 本工程当前用"文本命令/属性回传"实现按钮交互，这里先把事件打印出来，
-     * 便于后续需要时改成"按页ID+控件ID"驱动（不受命令粘连影响）。 */
+     * 便于后续需要时改成"按页ID+控件ID"驱动（不受命令粘连影响）。
+     * 注意：本回调跑在 uart.c 的最高优先级 rx_task 里，只记活动、绝不做重活。 */
     ESP_LOGI(TAG, "屏幕控件事件: 页ID=%u 控件ID=%u %s（尚未映射到功能）",
              page_id, comp_id, event == 0x01 ? "按下" : "弹起");
+    power_note_activity(POWER_SRC_SCREEN);      /* 手指真的按了屏幕 → 算用户活动 */
 }
 
 static void ui_on_tjc_page_id(uint8_t page_id)

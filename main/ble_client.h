@@ -165,6 +165,18 @@ void ble_client_connect(void);
  */
 void ble_client_disconnect(void);
 
+/**
+ * @brief 整机休眠前收尾：停扫描 + 断链路 + 关自动重连 + 注销 GATTC 应用
+ * @note  必须在 esp_bluedroid_disable() **之前**调用（详见 ble_client.c 说明）
+ */
+void ble_client_suspend_for_sleep(void);
+
+/**
+ * @brief 整机唤醒后恢复 BLE 主机链路：重新注册应用（或复用）并开始扫描/重连
+ * @note  必须在 esp_bluedroid_enable() 与 bt_a2dp_work() 之后调用
+ */
+void ble_client_resume_after_sleep(void);
+
 #ifdef __cplusplus
 }
 #endif

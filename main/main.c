@@ -19,6 +19,7 @@
 #include "health.h"      // 手表健康数据（解析 + NVS 保存 + health 页刷新 + 睡眠联动）
 #include "sd.h"
 #include <adc.h>
+#include "power.h"       // 整机休眠看护（静默超时关外设 + light sleep + 串口唤醒）
 
 #define GPIO_INPUT_PIN   (1ULL << GPIO_NUM_0)
 #define LONG_PRESS_TIME 2000  // 长按阈值：2000ms
@@ -104,8 +105,29 @@ static void key_scan(void* arg)
     }
 }
 
+/* 复位原因（整机休眠/蓝牙反复开关期间排查"跑一段时间就重启"时，第一条要看的信息） */
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "上电/复位脚";
+    case ESP_RST_EXT:       return "外部复位";
+    case ESP_RST_SW:        return "软件复位（esp_restart）";
+    case ESP_RST_PANIC:     return "异常复位（panic，看上面的 backtrace）";
+    case ESP_RST_INT_WDT:   return "中断看门狗";
+    case ESP_RST_TASK_WDT:  return "任务看门狗";
+    case ESP_RST_WDT:       return "其他看门狗";
+    case ESP_RST_DEEPSLEEP: return "深睡唤醒";
+    case ESP_RST_BROWNOUT:  return "欠压复位（brownout，查电源/功放冲击）";
+    default:                return "未知";
+    }
+}
+
 void app_main(void)
 {
+    /* 先报复位原因：连续重启时这一行能把"软件 panic / 看门狗 / 欠压"区分开 */
+    esp_reset_reason_t rr = esp_reset_reason();
+    ESP_LOGW("esp", "本次启动复位原因: %d (%s)", (int)rr, reset_reason_str(rr));
+
     /* ---------- 1. 串口屏链路 + 交互层（最先起，方便开机就把状态刷到屏幕） ---------- */
     uart_2_init();      //串口屏通讯（陶晶驰协议：发送自动补帧尾，接收断帧）
     ui_init();          //串口屏交互层：页面状态机 + 命令分发（必须在 uart_2_init 之后）
@@ -135,6 +157,13 @@ void app_main(void)
     key_init();
     xTaskCreate(key_scan, "key_scan", 2048, NULL, 10, NULL);      //创建key扫描任务
 //              入口函数 终端显示函数名 栈深  参数 优先级 句柄
+
+    /* ---------- 7. 整机休眠看护（必须最后起：此时四类活动源都已在计活动） ----------
+     * 连续 POWER_IDLE_TIMEOUT_MS（默认 3 分钟）没有"串口屏有效指令 / 手表 BLE 回传 /
+     * A2DP 音频流 / AVRCP 控制指令"就：关功放 → 关灯带 → 关双模蓝牙 → 进 light sleep；
+     * 唯一唤醒源是串口屏 RX（GPIO16 低电平），醒来后等一条有效指令再恢复外设与蓝牙。
+     * 详见 main/power.h。 */
+    power_init();
 
     // 说明：音箱在本工程中**只作 BLE 主机**，连接手表；
     //       BLE 侧调试代码（main/ble_debug.c、HCI 取证）、手机从机反向方案

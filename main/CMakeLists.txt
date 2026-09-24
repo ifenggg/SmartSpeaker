@@ -6,7 +6,7 @@
 #   ble_debug.c  —— 调试阶段代码：连上后定期发 $PING + 打印收到的帧（详见文件顶部说明）
 #   ble.c        —— 早期 BLE 服务端+客户端示例实现（已废弃）
 #   ble_server.c —— 早前"音箱作 BLE 从机"的反向方案（当前设计是音箱只作主机）
-idf_component_register(SRCS "amp.c"
+idf_component_register(SRCS "power.c" "amp.c"
                             "audio_vol.c"
                             "ble_gap.c"
                             "ble_client.c"

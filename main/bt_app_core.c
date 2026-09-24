@@ -11,6 +11,7 @@
 #include "amp.h"
 #include "audio_vol.h"
 #include "uart.h"       /* ui_res：串口屏命令缓冲（bt_vo 解析音量时读取） */
+#include "bt_app_av.h"  /* bt_con_flag：判断是否连着手机（未连接时不发 AVRCP 命令） */
 #include "driver/i2s_std.h"
 #include "freertos/ringbuf.h"
 #include "esp_a2dp_api.h"
@@ -81,6 +82,12 @@ void bt_sleep(void)
     amp_set_power(false);           // 暂停：立即关断功放（静音且省电）
     /* 保持接收音频（write_data_sleep_flag = 1）：手机上再点播放时音箱能立刻跟随 */
     write_data_sleep_flag = 1;
+    /* 未连接手机时不发 AVRCP 暂停：BTC 只会警告 "RC is not connected"，
+     * 而整机休眠每轮都会走到这里，日志会被这类警告刷屏 */
+    if (!bt_con_flag) {
+        ESP_LOGI("bt_sleep", "未连接手机：只关功放，不发 AVRCP 暂停");
+        return;
+    }
     esp_avrc_ct_send_passthrough_cmd(
             0,
         ESP_AVRC_PT_CMD_PAUSE,

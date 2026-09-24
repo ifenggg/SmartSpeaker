@@ -59,6 +59,12 @@ const char *ui_page_name(ui_page_t page);
 /* 屏幕是否已休眠（收到 exit 后 UI_EXIT_GRACE_MS 内没有新页面名） */
 bool ui_is_screen_asleep(void);
 
+/**
+ * @brief 整机从 light sleep 醒来、外设恢复完成后调用（由 power.c 调用）
+ * @note  会发 sendme 并补发当前页状态；屏幕本身还在休眠时不做任何推送
+ */
+void ui_on_mcu_wake(void);
+
 /* 处理一条屏幕命令（内部使用；也可在调试代码里手动调用） */
 void ui_process_command(const char *cmd);
 

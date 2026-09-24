@@ -46,3 +46,26 @@ void bt_init(void);
  * @return true=已开启 false=已关闭
  */
 bool bt_a2dp_is_on(void);
+
+/* =====================================================================
+ * 整机休眠：双模蓝牙整体关/开
+ * ---------------------------------------------------------------------
+ * bt_stack_sleep() 把蓝牙关到"可以安全进 light sleep"的状态：
+ *   A2DP/AVRCP 反初始化 + 释放 I2S + BLE 链路收尾 + esp_bluedroid_disable()
+ *   + esp_bt_controller_disable()（用 disable，不用 deinit —— 见 bt_a2dp.c 说明）
+ * bt_stack_wake() 反顺序恢复：控制器 enable → Bluedroid enable → GAP 回调重注册
+ *   → bt_a2dp_work()（仅当休眠前总开关是开的）→ BLE 主机链路恢复扫描。
+ * ===================================================================== */
+
+/**
+ * @brief 关闭双模蓝牙（整机休眠前调用；调用前应先 bt_sleep() 让对端暂停）
+ * @return ESP_OK=已关闭（可进 light sleep）；其他=关闭失败，**不要**进 light sleep
+ */
+esp_err_t bt_stack_sleep(void);
+
+/**
+ * @brief 恢复双模蓝牙（整机唤醒、收到有效指令后调用）
+ * @param a2dp_on true=恢复 A2DP/AVRCP 功能层（休眠前总开关是开的时传 true）
+ * @return ESP_OK=成功；其他=失败（BLE/串口屏不受影响，可再触发一次）
+ */
+esp_err_t bt_stack_wake(bool a2dp_on);

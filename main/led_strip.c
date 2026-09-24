@@ -436,17 +436,36 @@ void leds_deinit(void)
         return;
     }
 
+    /* 【必须无条件 disable】RMT 通道在 leds_init() 里创建后就已经 enable 了。
+     * 旧实现只在"当时是亮着"时才 rmt_disable()，而整机休眠时灯带通常是熄灯状态，
+     * 于是 rmt_del_channel() 以 "channel not in init state" 失败——通道和 GPIO 预留
+     * 都不会释放，下次 leds_init() 就报 "GPIO 33 is not usable, maybe conflict with
+     * others"，并且每轮休眠泄漏一个 RMT 通道（几次之后 rmt_new_tx_channel 的
+     * ESP_ERROR_CHECK 就会把整机复位）。 */
     if (s_leds_on) {
         update_led(0, 0, 0);
         s_leds_on = false;
-        rmt_disable(led_chan);
     }
+    if (led_chan) {
+        esp_err_t err = rmt_disable(led_chan);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(LTAG, "关闭 RMT 通道失败: %s", esp_err_to_name(err));
+        }
+    }
+
     if (led_encoder) {
         rmt_del_encoder(led_encoder);
         led_encoder = NULL;
     }
     if (led_chan) {
-        rmt_del_channel(led_chan);
+        esp_err_t err = rmt_del_channel(led_chan);
+        if (err != ESP_OK) {
+            /* 极少数情况（通道状态没收干净）会失败：这里**不能**把 s_leds_ready 置假，
+             * 否则下次 leds_init() 会在旧通道还在的情况下再建一个（泄漏 → 最终断言复位）。
+             * 保留 ready 标记并保留通道句柄，下一轮休眠会再试一次释放。 */
+            ESP_LOGE(LTAG, "释放 RMT 通道失败: %s（本轮保留资源，下轮再试）", esp_err_to_name(err));
+            return;
+        }
         led_chan = NULL;
     }
     s_leds_ready = false;

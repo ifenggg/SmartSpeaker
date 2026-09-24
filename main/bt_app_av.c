@@ -24,6 +24,7 @@
 
 #include "ui.h"     /* 串口屏界面状态：当前页判断 + 状态推送 */
 #include "health.h" /* 健康数据：A2DP 重连时解除手表睡眠(SLEEP=2)锁定 */
+#include "power.h"  /* 整机休眠：A2DP 音频流 / AVRCP 控制指令算活动 */
 
 //AVRCP（音视频远程控制协议）使用的事务标签
 #define APP_RC_CT_TL_GET_CAPS            (0)    //标识 AVRCP 控制器发起的 “获取对方设备能力” 操作
@@ -347,8 +348,10 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             // s_pkt_cnt = 0;  // 重置数据包计数
             // s_avrc_peer_rn_cap.bits = 0;    //清除对等方通知能力记录
 
-            bt_i2s_driver_uninstall();  //卸载iis驱动器和相关任务
+            /* 顺序：先停 I2S 任务再释放通道，避免任务拿着已释放的 tx_chan 去写
+             * （use-after-free）；两者内部都有幂等守卫。 */
             bt_i2s_task_shut_down();
+            bt_i2s_driver_uninstall();  //卸载iis驱动器和相关任务
             amp_set_power(false);   // 蓝牙断开 → 关断功放
             bt_con_flag = 0;        // 【修复】断开后清零连接标志，否则后续"关蓝牙"会重复反初始化 I2S
         } 
@@ -505,6 +508,8 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
                  rc->conn_stat.connected, bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
 
         if (rc->conn_stat.connected) {
+            /* 手机建立了 AVRCP 连接 = 用户正在用音箱 → 算整机休眠活动 */
+            power_note_activity(POWER_SRC_AVRCP);
             //获取远程设备支持的事件通知
             esp_avrc_ct_send_get_rn_capabilities_cmd(APP_RC_CT_TL_GET_CAPS);
         } else {
@@ -544,6 +549,8 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
     }
     //处理远程设备的状态变化通知（播放状态、曲目、音量）
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT: {
+        /* 对端主动上报（播放状态/曲目/进度变化）= 手机侧有人在操作 → 算活动 */
+        power_note_activity(POWER_SRC_AVRCP);
         ESP_LOGI(BT_RC_CT_TAG, "AVRC 事件通知: %d", rc->change_ntf.event_id);
         bt_av_notify_evt_handler(rc->change_ntf.event_id, &rc->change_ntf.event_parameter);
         break;
@@ -593,17 +600,21 @@ static void bt_av_hdl_avrc_tg_evt(uint16_t event, void *p_param)
     }
     //接收来自控制器的遥控命令
     case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT: {
+        /* 手机侧按下播放/暂停/上下曲 → 算整机休眠活动（这是"AVRCP 控制指令"的主路径） */
+        power_note_activity(POWER_SRC_AVRCP);
         ESP_LOGI(BT_RC_TG_TAG, "AVRC 收到按键命令: 按键ID 0x%x, 按键状态 %d", rc->psth_cmd.key_code, rc->psth_cmd.key_state);
         break;
     }
     //从远程设备设置绝对音量命令
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT: {
+        power_note_activity(POWER_SRC_AVRCP);
         ESP_LOGI(BT_RC_TG_TAG, "AVRC 收到设置音量: %d%%", (int)rc->set_abs_vol.volume * 100 / 0x7f);
         volume_set_by_controller(rc->set_abs_vol.volume);
         break;
     }
     //处理控制器的通知注册请求
     case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT: {
+        power_note_activity(POWER_SRC_AVRCP);
         ESP_LOGI(BT_RC_TG_TAG, "AVRC 注册事件通知%d, param: 0x%"PRIx32, rc->reg_ntf.event_id, rc->reg_ntf.event_parameter);
         if (rc->reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
             s_volume_notify = true;
@@ -651,6 +662,13 @@ void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 
 void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 {
+    /* 整机休眠判据之一：收到 A2DP 音频数据包 = 手机正在推流。
+     * 必须放在下面 write_data_sleep_flag 的提前 return **之前**：
+     * 否则"暂停后仍保持接收"（flag=1）与"关蓝牙后不再接收"（flag=0）两种情况下
+     * 计数口径会不一致，暂停态漏计会导致正在用的音箱被误判为空闲。
+     * 本回调节奏很密（每个音频包一次），这里只写一个 tick，零额外开销。 */
+    power_note_activity(POWER_SRC_A2DP);
+
     if(!write_data_sleep_flag)
     {
         return;
@@ -666,6 +684,11 @@ void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 
 void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
 {
+    /* 【重要】这里**不能**无条件记"整机休眠活动"：
+     * 关蓝牙/整机休眠时 AVRCP 反初始化会往这里抛出一堆本模块未处理的内部事件
+     * （日志里的 "Invalid AVRC event: 10"），把倒计时当成"有活动"，
+     * 结果是每次静默到点准备休眠时都被自己打断（日志：关断期间收到有效指令）。
+     * 现在只在**对端主动发起**的事件处理分支里记活动（见 bt_av_hdl_avrc_ct_evt）。 */
     switch (event) {
     case ESP_AVRC_CT_METADATA_RSP_EVT:
         bt_app_alloc_meta_buffer(param);    // 专门处理元数据内存分配
@@ -686,6 +709,9 @@ void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param
 
 void bt_app_rc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
 {
+    /* 与 bt_app_rc_ct_cb 同理：活动只在**对端主动发起**的事件处理分支里记
+     * （见 bt_av_hdl_avrc_tg_evt），不能在回调入口无条件记，
+     * 否则反初始化/重初始化期间抛出的内部事件会不断给休眠倒计时续命。 */
     switch (event) {
     case ESP_AVRC_TG_CONNECTION_STATE_EVT:
     case ESP_AVRC_TG_REMOTE_FEATURES_EVT:

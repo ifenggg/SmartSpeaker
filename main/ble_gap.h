@@ -31,6 +31,14 @@ typedef void (*ble_gap_handler_t)(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_p
  */
 esp_err_t ble_gap_add_handler(ble_gap_handler_t handler);
 
+/**
+ * @brief 重新注册统一的 GAP 系统回调（整机休眠唤醒后调用，幂等）
+ * @note  Bluedroid 被 disable 再 enable 后不保证回调仍有效；本函数把同一个分发函数
+ *        再注册一次（覆盖式赋值，安全）。处理者列表不变，无需重新 add_handler。
+ * @return ESP_OK 成功；其他为底层返回
+ */
+esp_err_t ble_gap_reregister(void);
+
 #ifdef __cplusplus
 }
 #endif

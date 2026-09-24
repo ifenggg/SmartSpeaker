@@ -1,0 +1,18 @@
+# =====================================================================
+# Smart_Speaker 工程默认配置（ESP-IDF v5.5.2）
+# ---------------------------------------------------------------------
+# 注意：本仓库的 sdkconfig 是本地生成文件（已在 .gitignore 里忽略），
+#       所以"必须随代码走"的开关要写在这里，新克隆/CI 才能拿到同一套配置。
+# =====================================================================
+
+# 整机休眠（main/power.c）需要电源管理支持：
+#   · 显式 esp_light_sleep_start() 本身并不要求它，但打开后 esp_pm_lock 才生效
+#     （I2S 等外设会创建 NO_LIGHT_SLEEP 锁，能作为"外设还没关干净"的安全网）；
+#   · 不在运行时调用 esp_pm_configure()，因此没有 DFS、也不会自动休眠。
+CONFIG_PM_ENABLE=y
+
+# 故意**不**打开 tickless（自动 light sleep）：
+#   CONFIG_FREERTOS_USE_TICKLESS_IDLE 会让系统在任意空闲点进 light sleep，
+#   串口屏 115200 的收包会在休眠窗口里丢字节/粘帧，且与本工程"静默 3 分钟才睡"
+#   的语义冲突。整机休眠只走 main/power.c 的显式 esp_light_sleep_start()。
+# CONFIG_FREERTOS_USE_TICKLESS_IDLE is not set

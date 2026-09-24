@@ -26,6 +26,7 @@
 
 #include "uart.h"           /* uart_send_text */
 #include "ui.h"             /* ui_get_page */
+#include "power.h"          /* 整机休眠：手表 BLE 数据回传算活动 */
 #include "ble_client.h"     /* ble_client_get_state / ble_client_send / ble_client_set_rx_cb */
 #include "bt_app_core.h"    /* bt_sleep（AVRCP 暂停 + 关功放） */
 #include "amp.h"            /* amp_set_power */
@@ -33,6 +34,18 @@
 #include "audio_vol.h"      /* audio_vol_set_dim_permille */
 
 static const char *TAG = "HEALTH";
+
+/* =====================================================================
+ * 整机休眠口径：手表回传怎么算"活动"（对应 power.h 的活动源②）
+ * ---------------------------------------------------------------------
+ *   1 = 任意 BLE notify 都算（含单独 SLEEP 帧、心跳）—— **当前采用**；
+ *   0 = 只有真正的传感器数据帧（$DATA，带 T=/HR=/STEP= 等字段）才算。
+ *
+ * 为什么留这个开关：按 health.h 的协议说明，只要 BLE 连接着，手表**随时**会推 SLEEP。
+ * 若实测发现"手表每 1 分钟推一次 SLEEP，整机永远不休眠"，把这里改成 0 即可
+ * （SLEEP 帧仍照常驱动音量/灯带减弱逻辑，只是不再给整机休眠倒计时续命）。
+ * ===================================================================== */
+#define HEALTH_ACTIVITY_ANY_NOTIFY   1
 
 /* ============================ 数据帧常量 ============================ */
 #define HEALTH_FRAME_HEAD   "$DATA,"        /* 传感器数据帧头 */
@@ -272,6 +285,10 @@ static void health_handle_line(char *line)
     if (sensor_seen) {
         s_store.has_data = true;
         s_new_frame = true;
+        if (!HEALTH_ACTIVITY_ANY_NOTIFY) {
+            /* 口径 0：只有真正的传感器数据帧才算"手表有数据回传" */
+            power_note_activity(POWER_SRC_WATCH);
+        }
     }
 
     ESP_LOGI(TAG, "数据帧: T=%.1f℃ H=%d%% HR=%d SPO2=%d STEP=%d P=%.1fhPa SLEEP=%d ST=%.1fh",
@@ -283,6 +300,13 @@ static void health_handle_line(char *line)
 /** BLE 通知回调：按 \r\n 重组整帧 */
 void health_on_ble_frame(uint8_t *data, uint16_t len)
 {
+    /* 整机休眠判据之一：手表只要回传了数据就算活动（口径见文件顶部的
+     * HEALTH_ACTIVITY_ANY_NOTIFY；当前 = 任意 notify 都算，含 SLEEP 帧与心跳）。
+     * 本回调跑在蓝牙协议栈回调上下文里，只写一个时间戳，绝不做重活。 */
+    if (HEALTH_ACTIVITY_ANY_NOTIFY && len > 0) {
+        power_note_activity(POWER_SRC_WATCH);
+    }
+
     for (uint16_t i = 0; i < len; i++) {
         char c = (char)data[i];
 

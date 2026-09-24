@@ -21,8 +21,8 @@
  * （溢出丢字节正是"真实命令被掩盖"的另一种可能） */
 #define RX_RINGBUF_SIZE  (RX_BUF_SIZE * 2)
 
-#define TXD_PIN          (GPIO_NUM_17)   /* ESP32 TX → 屏幕 RX */
-#define RXD_PIN          (GPIO_NUM_16)   /* ESP32 RX ← 屏幕 TX */
+#define TXD_PIN          UART_SCREEN_TXD_GPIO   /* ESP32 TX → 屏幕 RX（定义见 uart.h） */
+#define RXD_PIN          UART_SCREEN_RXD_GPIO   /* ESP32 RX ← 屏幕 TX（整机休眠的唤醒源） */
 
 /* ---------------------------------------------------------------------
  * 调试日志开关
@@ -49,6 +49,7 @@ static SemaphoreHandle_t s_tx_mutex = NULL;     /* 发送互斥锁 */
 static uart_tjc_key_cb_t  s_key_cb  = NULL;     /* 0x65 控件点击回调 */
 static uart_tjc_page_cb_t s_page_cb = NULL;     /* 0x66 页面 ID 回调 */
 static uart_tjc_event_cb_t s_event_cb = NULL;   /* 0x86/0x87/0x88 屏幕状态回调 */
+static volatile bool s_rx_discard_req = false;  /* 请求丢弃"正在累积的半帧"（整机唤醒后用） */
 
 static void rx_task(void *arg);
 static void uart_dump_raw_rx(const uint8_t *data, size_t len);
@@ -176,6 +177,13 @@ bool uart_recv_ui_cmd(char *out, uint32_t out_sz, uint32_t wait_ms)
     return true;
 }
 
+void uart_rx_discard_pending(void)
+{
+    /* 驱动环形缓冲区里的残片直接丢；rx_task 累积到一半的帧由标志位通知它丢 */
+    uart_flush_input(UART_NUM_2);
+    s_rx_discard_req = true;
+}
+
 /* =====================================================================
  * 接收：断帧
  * ===================================================================== */
@@ -233,6 +241,15 @@ void rx_task(void *arg)
         /* 超时 = 断帧空闲阈值：读不到字节说明屏幕这一批数据发完了 */
         const int length = uart_read_bytes(UART_NUM_2, rx, RX_BUF_SIZE,
                                            pdMS_TO_TICKS(UI_RX_IDLE_MS));
+
+        /* 整机从 light sleep 醒来后的一次性清理：本次读到的字节与正在累积的半帧一起丢
+         * （这些字节是"唤醒前/唤醒瞬间"的残片，必然不完整，解析出来只会是无效命令） */
+        if (s_rx_discard_req) {
+            s_rx_discard_req = false;
+            acc_len = 0;
+            uart_flush_input(UART_NUM_2);
+            continue;
+        }
 
         if (length <= 0) {
             /* 空闲：把累计内容当作一条"无帧尾"命令（prints 风格）处理 */

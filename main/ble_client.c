@@ -1109,7 +1109,12 @@ void ble_client_disconnect(void)
     xTimerStop(s_scan_timer, 0);
     xTimerStop(s_conn_timer, 0);
     xTimerStop(s_reconnect_timer, 0);
-    esp_ble_gap_stop_scanning();
+    /* 只在真的在扫描时停：扫描本就没跑时调用它会得到栈内两条错误日志
+     * （"BTM_BleScan scan not active" + "bta_dm_ble_scan stop scan failed, status=0x6"）。
+     * 整机休眠每轮都会走到这里，白白刷两行 E/W 出来。 */
+    if (ble_c_state_get() == BLE_C_STATE_SCANNING) {
+        esp_ble_gap_stop_scanning();
+    }
 
     uint16_t cid = s_conn_id;
     if (cid != 0 && s_gattc_if != ESP_GATT_IF_NONE) {
@@ -1119,4 +1124,68 @@ void ble_client_disconnect(void)
         ble_c_reset_link();
         ESP_LOGI(TAG, "手动断开完成（当前无连接）");
     }
+}
+
+/* ---------------------------------------------------------------------
+ * 整机休眠：关栈前收尾 / 唤醒后恢复
+ * ---------------------------------------------------------------------
+ * 关：停扫描 + 断链路 + 关自动重连 + 注销 GATTC 应用（留着已注册的 profile 去
+ *     disable Bluedroid 容易被内部状态检查拒绝）；
+ * 开：能复用就复用（Bluedroid disable→enable 后应用注册可能仍在），
+ *     否则重新注册应用，成功后走 REG_EVT → 设扫描参数 → 开始扫描的老路。
+ * ------------------------------------------------------------------- */
+void ble_client_suspend_for_sleep(void)
+{
+    uint8_t was = ble_client_get_state();
+
+    ESP_LOGI(TAG, "整机休眠：停止 BLE 主机链路（当前状态=%u）", (unsigned)was);
+
+    ble_client_disconnect();        /* 停扫描/断链路/关闭自动重连（三个定时器一并停掉） */
+    if (was != BLE_CLIENT_STATE_DISCONNECTED) {
+        /* 给 CLOSE/DISCONNECT 事件一点时间落地，避免"带着连接"去关协议栈 */
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (s_gattc_if != ESP_GATT_IF_NONE) {
+        esp_err_t err = esp_ble_gattc_app_unregister(s_gattc_if);
+        ESP_LOGI(TAG, "整机休眠：注销 GATTC 应用(if=%d) → %s",
+                 (int)s_gattc_if, esp_err_to_name(err));
+        s_gattc_if = ESP_GATT_IF_NONE;
+    } else {
+        ESP_LOGW(TAG, "整机休眠：GATTC 应用本来就没注册（if=NONE）");
+    }
+
+    ble_c_reset_link();             /* 状态复位 + 停表：唤醒后从干净的 IDLE 开始 */
+    s_auto_reconnect = false;       /* 休眠期间绝不允许自动重连（否则会拉高功耗/唤醒失败） */
+}
+
+void ble_client_resume_after_sleep(void)
+{
+    s_auto_reconnect = true;
+    s_fail_count = 0;
+    s_reconnect_scheduled = false;
+
+    if (s_gattc_if != ESP_GATT_IF_NONE) {
+        /* 少见但可能：Bluedroid disable→enable 之后应用注册仍被保留 → 直接恢复扫描 */
+        ESP_LOGI(TAG, "整机唤醒：GATTC 应用仍有效(if=%d) → 直接恢复扫描/重连", (int)s_gattc_if);
+        ble_client_connect();
+        return;
+    }
+
+    ESP_LOGI(TAG, "整机唤醒：重新注册 GATTC 应用并恢复扫描");
+
+    /* 回调是覆盖式赋值，重复注册同一个函数安全 */
+    esp_err_t err = esp_ble_gattc_register_callback(gattc_event_handler);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GATTC 回调重新注册失败: 0x%x", err);
+    }
+
+    err = esp_ble_gattc_app_register(BLE_CLIENT_APP_ID);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GATTC 应用重新注册失败: 0x%x（本次唤醒后 BLE 可能不可用；"
+                      "再操作一次屏幕命令会重试唤醒流程）", err);
+        return;
+    }
+    /* 成功后：ESP_GATTC_REG_EVT → esp_ble_gap_set_scan_params()
+     *          → ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT → ble_c_start_scan() */
 }

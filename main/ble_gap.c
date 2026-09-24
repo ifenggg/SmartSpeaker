@@ -55,3 +55,18 @@ esp_err_t ble_gap_add_handler(ble_gap_handler_t handler)
     ESP_LOGI(TAG, "已登记 GAP 处理函数 #%u", (unsigned)s_handler_count);
     return ESP_OK;
 }
+
+esp_err_t ble_gap_reregister(void)
+{
+    /* esp_ble_gap_register_callback() 是**覆盖式**赋值，重复注册同一个分发函数是安全的；
+     * 整机休眠会把 Bluedroid disable 再 enable，这里重新注册一次做保险
+     * （处理者列表 s_handlers[] 在 RAM 里，不需要重建）。 */
+    esp_err_t err = esp_ble_gap_register_callback(ble_gap_sys_cb);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "重新注册 GAP 回调失败: 0x%x", err);
+        return err;
+    }
+    s_sys_cb_registered = true;
+    ESP_LOGI(TAG, "GAP 回调已重新注册（整机休眠唤醒后调用）");
+    return ESP_OK;
+}
